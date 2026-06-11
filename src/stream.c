@@ -1,10 +1,13 @@
 /* portico-tunnel stream engine (see stream.h). One poll loop multiplexes the tunnel fd
- * + all endpoint fds. The agent and relay share it — only how a stream is BORN differs:
+ * + listeners + per-stream endpoint fds (+ relay SNI "peekers"). The agent and relay
+ * share it — only how a stream is BORN differs:
  *   - agent: an incoming OPEN -> dial the forward's local target;
- *   - relay: a public connection accepted on a listener -> allocate a stream + send OPEN.
+ *   - relay tcp: a public connection accepted -> allocate stream + send OPEN;
+ *   - relay sni: accept -> buffer the ClientHello -> SNI route -> open + feed buffer.
  * Everything after (DATA both ways, END/RESET, backpressure, reaping) is identical. */
 #include "stream.h"
 #include "frame.h"
+#include "sni.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -19,18 +22,27 @@
 
 #define MAX_STREAMS   64
 #define MAX_LISTENERS 16
-#define TW_CAP        (4 * (TUNNEL_FRAME_HDR + TUNNEL_MAX_FRAME))   /* shared tunnel-out buffer */
-#define OPEN_HDR      96                                           /* room reserved for an OPEN frame */
+#define MAX_PEEKERS   32
+#define PEEK_CAP      (TUNNEL_MAX_FRAME + 512)   /* max ClientHello + a little slack */
+#define TW_CAP        (4 * (TUNNEL_FRAME_HDR + TUNNEL_MAX_FRAME))
+#define OPEN_HDR      96
+/* room needed in the tunnel-out buffer to resolve a peeker: OPEN + up to two DATA. */
+#define PEEK_ROOM     (OPEN_HDR + 2 * (TUNNEL_FRAME_HDR + TUNNEL_MAX_FRAME))
 
 struct stream {
     int      active;
     uint32_t sid;
-    int      fd;                            /* endpoint socket (local origin / public peer) */
-    unsigned char tobuf[TUNNEL_MAX_FRAME];  /* bytes pending toward the endpoint fd */
+    int      fd;
+    unsigned char tobuf[TUNNEL_MAX_FRAME];
     size_t   tolen, tooff;
-    int      remote_eof;                    /* got END from the tunnel */
-    int      local_eof;                     /* endpoint hit EOF, we sent END */
-    int      wr_shut;                       /* shutdown(fd, WR) already done */
+    int      remote_eof, local_eof, wr_shut;
+};
+
+struct peeker {                                  /* relay: accepted, awaiting SNI */
+    int      active;
+    int      fd;
+    unsigned char buf[PEEK_CAP];
+    size_t   len;
 };
 
 static void set_nonblock(int fd) {
@@ -53,7 +65,7 @@ static int dial_local(const tunnel_target_t *t) {
     for (ai = res; ai; ai = ai->ai_next) {
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd < 0) continue;
-        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;   /* local target -> instant */
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
         close(fd); fd = -1;
     }
     freeaddrinfo(res);
@@ -92,37 +104,70 @@ static void close_stream(struct stream *s) {
     if (s->fd >= 0) close(s->fd);
     s->active = 0;
 }
+static int sni_lookup(const tunnel_sni_route_t *routes, size_t n, const char *host, uint32_t *fid) {
+    for (size_t i = 0; i < n; i++)
+        if (routes[i].host && strcmp(routes[i].host, host) == 0) { *fid = routes[i].forward_id; return 1; }
+    return 0;
+}
+
+/* Open a stream for an accepted public fd, sending OPEN{forward_id, client_ip}. The
+ * caller has reserved tw room. Returns the stream, or NULL (slot/room exhausted; fd
+ * closed). If `prefix`/`plen` is given (SNI peeker buffer), it is fed as initial DATA. */
+static struct stream *open_public(struct stream *st, uint32_t *next_sid, int fd, uint32_t fid,
+                                  const unsigned char *prefix, size_t plen,
+                                  unsigned char *tw, size_t *twlen) {
+    struct stream *s = alloc_stream(st, *next_sid);
+    if (!s) { close(fd); return NULL; }
+    s->fd = fd;
+    char ip[64]; peer_ip(fd, ip, sizeof ip);
+    unsigned char pl[OPEN_HDR]; put_be32(pl, fid);
+    size_t il = strlen(ip); if (il > OPEN_HDR - 4) il = OPEN_HDR - 4;
+    memcpy(pl + 4, ip, il);
+    if (tw_frame(tw, twlen, TF_OPEN, s->sid, pl, (uint32_t)(4 + il)) < 0) { close_stream(s); return NULL; }
+    (*next_sid)++;
+    for (size_t off = 0; off < plen; ) {
+        size_t c = plen - off; if (c > TUNNEL_MAX_FRAME) c = TUNNEL_MAX_FRAME;
+        if (tw_frame(tw, twlen, TF_DATA, s->sid, prefix + off, (uint32_t)c) < 0) break;
+        off += c;
+    }
+    return s;
+}
 
 static int serve_loop(int tfd, int is_relay,
                       const tunnel_listener_t *lis, size_t nlis,
-                      const tunnel_target_t *fwd, size_t nfwd) {
+                      const tunnel_target_t *fwd, size_t nfwd,
+                      const tunnel_sni_route_t *routes, size_t nroutes) {
     set_nonblock(tfd);
     if (is_relay) for (size_t i = 0; i < nlis; i++) set_nonblock(lis[i].listen_fd);
 
     tunnel_decoder_t dec; tunnel_decoder_reset(&dec);
     struct stream st[MAX_STREAMS]; memset(st, 0, sizeof st);
+    struct peeker pk[MAX_PEEKERS]; memset(pk, 0, sizeof pk);
     unsigned char tw[TW_CAP]; size_t twlen = 0, twoff = 0;
-    uint32_t next_sid = 1;                  /* relay allocates stream ids */
+    uint32_t next_sid = 1;
     int rc = 0;
 
     for (;;) {
-        int backpressured = 0, has_free = 0;
+        int backpressured = 0, has_free = 0, has_peeker = 0;
         for (int i = 0; i < MAX_STREAMS; i++) {
             if (st[i].active && st[i].tooff < st[i].tolen) backpressured = 1;
             if (!st[i].active) has_free = 1;
         }
-        int can_accept = is_relay && has_free && !backpressured &&
+        for (int i = 0; i < MAX_PEEKERS; i++) if (!pk[i].active) { has_peeker = 1; break; }
+        int can_accept = is_relay && has_free && has_peeker && !backpressured &&
                          (twlen + TUNNEL_FRAME_HDR + OPEN_HDR <= TW_CAP);
+        int can_peek = has_free && (twlen + PEEK_ROOM <= TW_CAP);
 
-        struct pollfd p[1 + MAX_LISTENERS + MAX_STREAMS];
-        struct stream *smap[1 + MAX_LISTENERS + MAX_STREAMS];
+        struct pollfd p[1 + MAX_LISTENERS + MAX_STREAMS + MAX_PEEKERS];
+        struct stream *smap[1 + MAX_LISTENERS + MAX_STREAMS + MAX_PEEKERS];
+        struct peeker *pmap[1 + MAX_LISTENERS + MAX_STREAMS + MAX_PEEKERS];
         p[0].fd = tfd; p[0].events = 0; p[0].revents = 0;
         if (!backpressured) p[0].events |= POLLIN;
         if (twoff < twlen)  p[0].events |= POLLOUT;
         int np = 1, lis_start = 1;
         if (can_accept)
             for (size_t i = 0; i < nlis; i++) { p[np].fd = lis[i].listen_fd; p[np].events = POLLIN; p[np].revents = 0; np++; }
-        int lis_end = np;
+        int lis_end = np, str_start = np;
         for (int i = 0; i < MAX_STREAMS; i++) {
             if (!st[i].active || st[i].fd < 0) continue;
             short ev = 0;
@@ -131,7 +176,14 @@ static int serve_loop(int tfd, int is_relay,
             if (ev == 0) continue;
             p[np].fd = st[i].fd; p[np].events = ev; p[np].revents = 0; smap[np] = &st[i]; np++;
         }
-        if (p[0].events == 0 && np == lis_end && lis_end == lis_start) break;   /* nothing to wait on */
+        int str_end = np;
+        if (can_peek)
+            for (int i = 0; i < MAX_PEEKERS; i++) {
+                if (!pk[i].active || pk[i].fd < 0) continue;
+                p[np].fd = pk[i].fd; p[np].events = POLLIN; p[np].revents = 0; pmap[np] = &pk[i]; np++;
+            }
+        int pk_end = np;
+        if (p[0].events == 0 && np == lis_end && lis_end == lis_start) break;
 
         if (poll(p, (nfds_t)np, -1) < 0) { if (errno == EINTR) continue; rc = -1; break; }
 
@@ -156,7 +208,7 @@ static int serve_loop(int tfd, int is_relay,
             }
         }
 
-        /* --- drain frames (while not backpressured) --- */
+        /* --- drain frames --- */
         for (;;) {
             int bp = 0;
             for (int i = 0; i < MAX_STREAMS; i++)
@@ -169,7 +221,7 @@ static int serve_loop(int tfd, int is_relay,
 
             if (f.type == TF_PING) { if (tw_frame(tw, &twlen, TF_PONG, 0, NULL, 0) < 0) { rc = -1; goto done; } continue; }
             if (f.type == TF_OPEN) {
-                if (is_relay) continue;     /* relay opens streams; it doesn't receive OPEN */
+                if (is_relay) continue;
                 uint32_t fid = (f.len >= 4) ? be32(f.payload) : 0xffffffffu;
                 struct stream *s = alloc_stream(st, f.stream_id);
                 if (!s || fid >= nfwd) { tw_frame(tw, &twlen, TF_RESET, f.stream_id, NULL, 0); if (s) s->active = 0; continue; }
@@ -196,7 +248,7 @@ static int serve_loop(int tfd, int is_relay,
             }
         }
 
-        /* --- relay: accept new public connections -> open streams --- */
+        /* --- relay: accept new public connections --- */
         if (can_accept) {
             for (int idx = lis_start; idx < lis_end; idx++) {
                 if (!(p[idx].revents & POLLIN)) continue;
@@ -204,22 +256,22 @@ static int serve_loop(int tfd, int is_relay,
                 for (;;) {
                     int c = accept(L->listen_fd, NULL, NULL);
                     if (c < 0) break;
-                    struct stream *s = alloc_stream(st, next_sid);
-                    if (!s) { close(c); break; }
-                    set_nonblock(c); s->fd = c;
-                    char ip[64]; peer_ip(c, ip, sizeof ip);
-                    unsigned char pl[OPEN_HDR]; put_be32(pl, L->forward_id);
-                    size_t il = strlen(ip); if (il > OPEN_HDR - 4) il = OPEN_HDR - 4;
-                    memcpy(pl + 4, ip, il);
-                    if (tw_frame(tw, &twlen, TF_OPEN, s->sid, pl, (uint32_t)(4 + il)) < 0) { close_stream(s); break; }
-                    next_sid++;
-                    if (twlen + TUNNEL_FRAME_HDR + OPEN_HDR > TW_CAP) break;   /* out of tunnel-out room */
+                    set_nonblock(c);
+                    if (L->sni) {                                  /* defer until ClientHello peeked */
+                        int placed = 0;
+                        for (int j = 0; j < MAX_PEEKERS; j++)
+                            if (!pk[j].active) { pk[j].active = 1; pk[j].fd = c; pk[j].len = 0; placed = 1; break; }
+                        if (!placed) { close(c); break; }
+                    } else if (!open_public(st, &next_sid, c, L->forward_id, NULL, 0, tw, &twlen)) {
+                        break;
+                    }
+                    if (twlen + TUNNEL_FRAME_HDR + OPEN_HDR > TW_CAP) break;
                 }
             }
         }
 
         /* --- per-stream endpoint I/O --- */
-        for (int k = lis_end; k < np; k++) {
+        for (int k = str_start; k < str_end; k++) {
             struct stream *s = smap[k];
             if (!s->active) continue;
             if (p[k].revents & POLLOUT) {
@@ -242,6 +294,24 @@ static int serve_loop(int tfd, int is_relay,
             }
         }
 
+        /* --- relay: feed SNI peekers, resolve to streams --- */
+        for (int k = str_end; k < pk_end; k++) {
+            struct peeker *q = pmap[k];
+            if (!q->active || !(p[k].revents & (POLLIN | POLLHUP))) continue;
+            ssize_t n = read(q->fd, q->buf + q->len, PEEK_CAP - q->len);
+            if (n <= 0) { if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) { close(q->fd); q->active = 0; } continue; }
+            q->len += (size_t)n;
+            char host[256];
+            int r = tunnel_sni_peek(q->buf, q->len, host, sizeof host);
+            if (r == 0) { if (q->len >= PEEK_CAP) { close(q->fd); q->active = 0; } continue; }
+            if (r < 0) { close(q->fd); q->active = 0; continue; }
+            uint32_t fid;
+            if (!sni_lookup(routes, nroutes, host, &fid)) { close(q->fd); q->active = 0; continue; }
+            int fd = q->fd;
+            q->active = 0; q->fd = -1;                       /* fd ownership moves to the stream */
+            open_public(st, &next_sid, fd, fid, q->buf, q->len, tw, &twlen);
+        }
+
         /* --- reap finished streams --- */
         for (int i = 0; i < MAX_STREAMS; i++)
             if (st[i].active && st[i].local_eof && st[i].remote_eof && st[i].tooff == st[i].tolen)
@@ -250,14 +320,17 @@ static int serve_loop(int tfd, int is_relay,
 
 done:
     for (int i = 0; i < MAX_STREAMS; i++) if (st[i].active) close_stream(&st[i]);
+    for (int i = 0; i < MAX_PEEKERS; i++) if (pk[i].active && pk[i].fd >= 0) close(pk[i].fd);
     return rc;
 }
 
 int tunnel_agent_serve(int tunnel_fd, const tunnel_target_t *forwards, size_t n_forwards) {
-    return serve_loop(tunnel_fd, 0, NULL, 0, forwards, n_forwards);
+    return serve_loop(tunnel_fd, 0, NULL, 0, forwards, n_forwards, NULL, 0);
 }
 
-int tunnel_relay_serve(int tunnel_fd, const tunnel_listener_t *listeners, size_t n_listeners) {
+int tunnel_relay_serve(int tunnel_fd,
+                       const tunnel_listener_t *listeners, size_t n_listeners,
+                       const tunnel_sni_route_t *routes, size_t n_routes) {
     if (n_listeners > MAX_LISTENERS) n_listeners = MAX_LISTENERS;
-    return serve_loop(tunnel_fd, 1, listeners, n_listeners, NULL, 0);
+    return serve_loop(tunnel_fd, 1, listeners, n_listeners, NULL, 0, routes, n_routes);
 }

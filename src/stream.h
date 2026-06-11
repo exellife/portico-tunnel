@@ -25,17 +25,27 @@ typedef struct {
  * closes. Returns 0 on clean tunnel EOF, -1 on error. */
 int tunnel_agent_serve(int tunnel_fd, const tunnel_target_t *forwards, size_t n_forwards);
 
-/* A relay TCP-forward listener: a listening socket the relay accepts public
- * connections on, each opened as a stream tagged with `forward_id` (§3.1 tcp mode). */
+/* A relay listener (§3.1). When `sni` is 0 it's a tcp port-forward: every connection
+ * opens a stream tagged with `forward_id`. When `sni` is 1 it's the shared :443 path:
+ * the relay peeks the ClientHello's SNI and routes via the route table below. */
 typedef struct {
     int      listen_fd;
-    uint32_t forward_id;
+    int      sni;            /* 1 = SNI-routed (peek), 0 = tcp port-forward */
+    uint32_t forward_id;     /* tcp mode only */
 } tunnel_listener_t;
 
+/* An SNI route: an exact hostname -> the forward the agent should dial. */
+typedef struct {
+    const char *host;
+    uint32_t    forward_id;
+} tunnel_sni_route_t;
+
 /* Run the relay's stream engine over a connected `tunnel_fd` (toward the agent) plus a
- * set of TCP listeners. On a public connection: allocate a stream_id, OPEN it to the
- * agent (with forward_id + client_ip), and splice both ways. Runs until the tunnel
- * closes. Returns 0 on clean tunnel EOF, -1 on error. */
-int tunnel_relay_serve(int tunnel_fd, const tunnel_listener_t *listeners, size_t n_listeners);
+ * set of listeners. tcp listeners open a stream per connection; sni listeners peek the
+ * ClientHello, match `routes` by hostname, then open a stream and feed the buffered
+ * handshake bytes as its first DATA. Runs until the tunnel closes. Returns 0 / -1. */
+int tunnel_relay_serve(int tunnel_fd,
+                       const tunnel_listener_t *listeners, size_t n_listeners,
+                       const tunnel_sni_route_t *routes, size_t n_routes);
 
 #endif /* PORTICO_TUNNEL_STREAM_H */

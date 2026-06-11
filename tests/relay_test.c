@@ -11,10 +11,12 @@
 #include <string.h>
 #include <stdint.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <openssl/ssl.h>
 
 static int ok = 0, fail = 0;
 static void chk(const char *n, int c) {
@@ -70,13 +72,31 @@ static int connect_loopback(const char *port) {
     return fd;
 }
 
+/* Drive OpenSSL just far enough to emit a ClientHello with `sni`; capture the bytes. */
+static int capture_clienthello(const char *sni, unsigned char *out, size_t cap) {
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    SSL *ssl = SSL_new(ctx);
+    int sp[2]; socketpair(AF_UNIX, SOCK_STREAM, 0, sp);
+    fcntl(sp[0], F_SETFL, O_NONBLOCK);
+    SSL_set_fd(ssl, sp[0]);
+    if (sni) SSL_set_tlsext_host_name(ssl, sni);
+    SSL_connect(ssl);
+    ssize_t n = read(sp[1], out, cap);
+    SSL_free(ssl); SSL_CTX_free(ctx); close(sp[0]); close(sp[1]);
+    return (int)n;
+}
+
 static tunnel_target_t g_fwd[1];
 static void *agent_thread(void *p) { tunnel_agent_serve((int)(intptr_t)p, g_fwd, 1); return NULL; }
-struct relay_ctx { int tfd, lfd; };
+struct relay_ctx { int tfd, tcp_lfd, sni_lfd; };
 static void *relay_thread(void *p) {
     struct relay_ctx *r = p;
-    tunnel_listener_t l = { .listen_fd = r->lfd, .forward_id = 0 };
-    tunnel_relay_serve(r->tfd, &l, 1);
+    tunnel_listener_t ls[2] = {
+        { .listen_fd = r->tcp_lfd, .sni = 0, .forward_id = 0 },   /* tcp port-forward */
+        { .listen_fd = r->sni_lfd, .sni = 1, .forward_id = 0 },   /* SNI-routed */
+    };
+    tunnel_sni_route_t routes[1] = { { .host = "sni.test", .forward_id = 0 } };
+    tunnel_relay_serve(r->tfd, ls, 2, routes, 1);
     return NULL;
 }
 
@@ -107,9 +127,10 @@ int main(void) {
     /* tunnel (socketpair) + agent + relay (public listener) */
     int tun[2]; socketpair(AF_UNIX, SOCK_STREAM, 0, tun);
     pthread_t ag; pthread_create(&ag, NULL, agent_thread, (void *)(intptr_t)tun[1]);
-    char pport[16];
-    int plfd = listen_loopback(pport, sizeof pport, NULL);
-    struct relay_ctx rc = { .tfd = tun[0], .lfd = plfd };
+    char pport[16], snport[16];
+    int plfd  = listen_loopback(pport, sizeof pport, NULL);    /* tcp forward */
+    int snlfd = listen_loopback(snport, sizeof snport, NULL);  /* SNI-routed */
+    struct relay_ctx rc = { .tfd = tun[0], .tcp_lfd = plfd, .sni_lfd = snlfd };
     pthread_t rl; pthread_create(&rl, NULL, relay_thread, &rc);
 
     /* ---- 1. single request, full round trip + half-close all the way back ---- */
@@ -155,10 +176,35 @@ int main(void) {
         close(c);
     }
 
+    /* ---- 4. SNI routing: a ClientHello with a known SNI reaches the forward ---- */
+    {
+        int c = connect_loopback(snport);
+        unsigned char ch[4096];
+        int chn = capture_clienthello("sni.test", ch, sizeof ch);
+        write_all(c, ch, (size_t)chn);                 /* relay peeks SNI, routes, feeds bytes */
+        unsigned char back[4096];
+        int got = read_n(c, back, (size_t)chn);        /* echo returns the same bytes */
+        chk("SNI-routed ClientHello bytes round-trip via the matched forward",
+            chn > 0 && got == chn && memcmp(back, ch, (size_t)chn) == 0);
+        close(c);
+    }
+
+    /* ---- 5. a ClientHello whose SNI matches no route is dropped ---- */
+    {
+        int c = connect_loopback(snport);
+        unsigned char ch[4096];
+        int chn = capture_clienthello("nope.test", ch, sizeof ch);
+        write_all(c, ch, (size_t)chn);
+        unsigned char back[64];
+        int got = (int)read(c, back, sizeof back);     /* relay closes -> EOF */
+        chk("unmatched SNI -> relay drops the connection", got == 0);
+        close(c);
+    }
+
     /* teardown: shutdown the tunnel (wakes both engines), join, then echo */
     shutdown(tun[0], SHUT_RDWR); shutdown(tun[1], SHUT_RDWR);
     pthread_join(rl, NULL); pthread_join(ag, NULL);
-    close(tun[0]); close(tun[1]); close(plfd);
+    close(tun[0]); close(tun[1]); close(plfd); close(snlfd);
 
     echo.stop = 1;
     int d = socket(AF_INET, SOCK_STREAM, 0);
