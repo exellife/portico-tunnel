@@ -97,6 +97,11 @@ if(TUNNEL_BUILD_TESTS)
     target_link_libraries(relay_deadline_test PRIVATE tunnel)
     add_test(NAME relay_deadline COMMAND relay_deadline_test)
 
+    # M5: agent registration timeout — a mute relay does not wedge the agent.
+    add_executable(register_timeout_test tests/register_timeout_test.c)
+    target_link_libraries(register_timeout_test PRIVATE tunnel)
+    add_test(NAME register_timeout COMMAND register_timeout_test)
+
     # CLI integration: run the actual binary (relay + agent) and tunnel a tcp forward.
     add_test(NAME cli COMMAND bash ${CMAKE_SOURCE_DIR}/tests/cli_test.sh $<TARGET_FILE:portico-tunnel>)
 

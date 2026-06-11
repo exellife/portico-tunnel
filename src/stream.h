@@ -73,6 +73,7 @@ typedef struct {
     int         heartbeat_secs;          /* 0 -> 20 */
     int         backoff_min_ms;          /* 0 -> 500 */
     int         backoff_max_ms;          /* 0 -> 30000 */
+    int         register_timeout_ms;     /* deadline for the HELLO exchange; 0 -> 10000 */
     atomic_int *stop;                    /* optional: set nonzero to stop the loop */
 } tunnel_agent_run_config_t;
 

@@ -425,6 +425,14 @@ int tunnel_agent_run(const tunnel_agent_run_config_t *cfg) {
                             cfg->client_cert, cfg->client_key, &tls) != 0)
             goto retry;
 
+        /* Bound the HELLO exchange so a dialed-but-mute relay can't pin the agent
+         * forever (bypassing reconnect/backoff). Cleared when serve makes the fd
+         * non-blocking. */
+        int rto = cfg->register_timeout_ms > 0 ? cfg->register_timeout_ms : 10000;
+        struct timeval rtv = { rto / 1000, (rto % 1000) * 1000 };
+        setsockopt(tls.fd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof rtv);
+        setsockopt(tls.fd, SOL_SOCKET, SO_SNDTIMEO, &rtv, sizeof rtv);
+
         tunnel_io_t io = tunnel_io_tls(&tls);
         tunnel_decoder_t rdec; tunnel_decoder_reset(&rdec);
         char err[256];
@@ -432,6 +440,10 @@ int tunnel_agent_run(const tunnel_agent_run_config_t *cfg) {
             tunnel_tls_free(&tls);
             goto retry;
         }
+        /* Registered — drop the blocking timeout; serve drives the fd non-blocking. */
+        struct timeval zero = { 0, 0 };
+        setsockopt(tls.fd, SOL_SOCKET, SO_RCVTIMEO, &zero, sizeof zero);
+        setsockopt(tls.fd, SOL_SOCKET, SO_SNDTIMEO, &zero, sizeof zero);
         backoff = bmin;                              /* a real session resets the backoff */
 
         tunnel_conn_t conn; tunnel_conn_ssl(&conn, tls.ssl);

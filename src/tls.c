@@ -21,6 +21,12 @@ static long ssl_recv(void *ctx, void *buf, size_t n) {
         if (r > 0) return r;
         int e = SSL_get_error(ssl, r);
         if (e == SSL_ERROR_ZERO_RETURN) return 0;                 /* clean close_notify */
+        /* On a blocking socket, a WANT/SYSCALL with EAGAIN means an SO_RCVTIMEO deadline
+         * fired — return error instead of spinning (this is how the handshake/HELLO/
+         * register timeouts are enforced). Genuine WANT on a blocking fd never carries
+         * EAGAIN, so this does not affect normal reads. */
+        if ((e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE || e == SSL_ERROR_SYSCALL)
+            && (errno == EAGAIN || errno == EWOULDBLOCK)) return -1;
         if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) continue;
         if (e == SSL_ERROR_SYSCALL && errno == EINTR) continue;
         return -1;
@@ -36,6 +42,8 @@ static long ssl_send(void *ctx, const void *buf, size_t n) {
         int w = SSL_write(ssl, p + off, want);
         if (w > 0) { off += (size_t)w; continue; }
         int e = SSL_get_error(ssl, w);
+        if ((e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE || e == SSL_ERROR_SYSCALL)
+            && (errno == EAGAIN || errno == EWOULDBLOCK)) return -1;   /* SO_SNDTIMEO deadline */
         if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) continue;
         if (e == SSL_ERROR_SYSCALL && errno == EINTR) continue;
         return -1;
