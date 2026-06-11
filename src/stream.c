@@ -548,9 +548,16 @@ int tunnel_relay_run(const tunnel_relay_run_config_t *cfg) {
         tunnel_decoder_t rdec; tunnel_decoder_reset(&rdec);
         tunnel_hello_t h; char err[256];
         if (tunnel_relay_accept(&io, &rdec, &h, tls.peer_id, cfg->allow, cfg->allow_ud, err, sizeof err) == 0) {
+            /* H4: serve only the SNI routes THIS agent's verified identity is authorized for,
+             * not the relay's whole table — so one tenant can't receive (and MITM) another
+             * tenant's hostnames. With allow_all every route passes (single-tenant default). */
+            tunnel_sni_route_t aroutes[64]; size_t naroutes = 0;
+            for (size_t i = 0; i < cfg->n_routes && naroutes < 64; i++)
+                if (!cfg->allow || cfg->allow(tls.peer_id, cfg->routes[i].host, cfg->allow_ud))
+                    aroutes[naroutes++] = cfg->routes[i];
             tunnel_conn_t conn; tunnel_conn_ssl(&conn, tls.ssl);
             int idle = cfg->idle_timeout_ms > 0 ? cfg->idle_timeout_ms : 30000;
-            serve_loop(&conn, 1, cfg->listeners, cfg->n_listeners, NULL, 0, cfg->routes, cfg->n_routes, hb, idle, &rdec, cfg->stop);
+            serve_loop(&conn, 1, cfg->listeners, cfg->n_listeners, NULL, 0, aroutes, naroutes, hb, idle, &rdec, cfg->stop);
         } else {
             fprintf(stderr, "relay: agent rejected: %s\n", err);
         }

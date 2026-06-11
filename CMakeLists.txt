@@ -112,6 +112,11 @@ if(TUNNEL_BUILD_TESTS)
     target_link_libraries(open_atomic_test PRIVATE tunnel)
     add_test(NAME open_atomic COMMAND open_atomic_test)
 
+    # H4: relay serves an agent only the SNI routes its identity is authorized for.
+    add_executable(route_authz_test tests/route_authz_test.c)
+    target_link_libraries(route_authz_test PRIVATE tunnel)
+    add_test(NAME route_authz COMMAND route_authz_test)
+
     # H4/M13: relay authorizes on the verified cert CN, not the spoofable HELLO agent_id.
     add_executable(cert_identity_test tests/cert_identity_test.c)
     target_link_libraries(cert_identity_test PRIVATE tunnel)
