@@ -24,16 +24,18 @@ if(TUNNEL_TSAN)
 endif()
 
 find_package(Threads REQUIRED)
+find_package(OpenSSL REQUIRED)   # the tunnel is TLS end to end — OpenSSL is mandatory
 
 # --- libtunnel: the shared core (relay + agent both link it) ---
 add_library(tunnel STATIC
     src/splice.c
     src/frame.c
     src/io.c
-    src/control.c)
+    src/control.c
+    src/tls.c)
 target_include_directories(tunnel PUBLIC src)
 target_compile_options(tunnel PRIVATE -Wall -Wextra -Wno-unused-parameter)
-target_link_libraries(tunnel PUBLIC Threads::Threads)
+target_link_libraries(tunnel PUBLIC Threads::Threads OpenSSL::SSL OpenSSL::Crypto)
 
 # --- tests ---
 option(TUNNEL_BUILD_TESTS "Build tests" ON)
@@ -54,4 +56,10 @@ if(TUNNEL_BUILD_TESTS)
     add_executable(control_test tests/control_test.c)
     target_link_libraries(control_test PRIVATE tunnel)
     add_test(NAME control COMMAND control_test)
+
+    # Control handshake over real mTLS: mint CA+certs, verify + register, with the
+    # negative controls (untrusted relay cert / no client cert are both rejected).
+    add_executable(control_tls_test tests/control_tls_test.c)
+    target_link_libraries(control_tls_test PRIVATE tunnel)
+    add_test(NAME control_tls COMMAND control_tls_test)
 endif()
