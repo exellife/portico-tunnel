@@ -112,6 +112,11 @@ if(TUNNEL_BUILD_TESTS)
     target_link_libraries(open_atomic_test PRIVATE tunnel)
     add_test(NAME open_atomic COMMAND open_atomic_test)
 
+    # M11: a duplicate OPEN for an active stream_id is rejected (no double-open).
+    add_executable(dup_open_test tests/dup_open_test.c)
+    target_link_libraries(dup_open_test PRIVATE tunnel)
+    add_test(NAME dup_open COMMAND dup_open_test)
+
     # M6: registration decoder handoff — a frame pipelined after HELLO_OK isn't lost.
     add_executable(register_handoff_test tests/register_handoff_test.c)
     target_link_libraries(register_handoff_test PRIVATE tunnel)

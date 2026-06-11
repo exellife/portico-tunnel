@@ -325,6 +325,8 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
             if (f.type == TF_PING) { if (tw_frame(tw, &twlen, TF_PONG, 0, NULL, 0) < 0) { rc = -1; goto done; } continue; }
             if (f.type == TF_OPEN) {
                 if (is_relay) continue;
+                struct stream *dup = find_stream(st, f.stream_id);
+                if (dup) { send_reset(dup, tw, &twlen); continue; }   /* M11: stream_id in use -> abort, don't double-open */
                 uint32_t fid = (f.len >= 4) ? be32(f.payload) : 0xffffffffu;
                 struct stream *s = alloc_stream(st, f.stream_id);
                 if (!s) { tw_frame(tw, &twlen, TF_RESET, f.stream_id, NULL, 0); continue; }  /* no slot: best effort */
