@@ -112,6 +112,11 @@ if(TUNNEL_BUILD_TESTS)
     target_link_libraries(open_atomic_test PRIVATE tunnel)
     add_test(NAME open_atomic COMMAND open_atomic_test)
 
+    # M4: a stalled stream is reset past a deadline and stops blocking the shared tunnel.
+    add_executable(stream_backpressure_test tests/stream_backpressure_test.c)
+    target_link_libraries(stream_backpressure_test PRIVATE tunnel)
+    add_test(NAME stream_backpressure COMMAND stream_backpressure_test)
+
     # H4: relay serves an agent only the SNI routes its identity is authorized for.
     add_executable(route_authz_test tests/route_authz_test.c)
     target_link_libraries(route_authz_test PRIVATE tunnel)

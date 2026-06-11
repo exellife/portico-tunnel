@@ -45,6 +45,7 @@ struct stream {
     int      connecting;       /* agent: the local target connect() is still in flight */
     long     connect_deadline; /* monotonic ms by which the connect must complete */
     long     last_activity;    /* monotonic ms of the last byte moved (or creation) */
+    long     last_flush;       /* monotonic ms tobuf was last empty or made send progress */
     int      activated;        /* has any byte ever flowed on this stream? */
     int      pending_end;      /* owe the peer a TF_END but tw was full — retry until sent */
     int      pending_reset;    /* tombstone: fd closed, owe the peer a TF_RESET — retry, then free */
@@ -121,7 +122,7 @@ static struct stream *alloc_stream(struct stream *st, uint32_t sid) {
         if (!st[i].active) {
             memset(&st[i], 0, sizeof st[i]);
             st[i].active = 1; st[i].sid = sid; st[i].fd = -1;
-            st[i].last_activity = now_ms();
+            st[i].last_activity = st[i].last_flush = now_ms();
             return &st[i];
         }
     return NULL;
@@ -241,7 +242,10 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
         }
         for (int i = 0; i < MAX_PEEKERS; i++) if (!pk[i].active) { has_peeker = 1; break; }
         int tw_room_open = (twlen + TUNNEL_FRAME_HDR + OPEN_HDR <= TW_CAP);
-        int can_accept_tcp = is_relay && has_free && !backpressured && tw_room_open;
+        /* M4: accepting a NEW public connection is independent of whether some OTHER stream's
+         * local sink is stalled — a slow client on one stream must not stop the relay taking
+         * new ingress. Gate only on a free slot + room for the OPEN, not the global flag. */
+        int can_accept_tcp = is_relay && has_free && tw_room_open;
         int can_accept_sni = can_accept_tcp && has_peeker;   /* sni needs a peeker slot; tcp does not */
         int can_peek = has_free && (twlen + PEEK_ROOM <= TW_CAP);
 
@@ -360,8 +364,8 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
                 memcpy(s->tobuf, f.payload, f.len);
                 s->tolen = f.len; s->tooff = 0;
                 ssize_t w = (f.len ? send(s->fd, s->tobuf, s->tolen, MSG_NOSIGNAL) : 0);
-                if (w > 0) { s->tooff += (size_t)w; if (s->tooff == s->tolen) s->tooff = s->tolen = 0; }
-                else if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                if (w >= 0) { s->tooff += (size_t)w; s->last_flush = now_ms(); if (s->tooff == s->tolen) s->tooff = s->tolen = 0; }
+                else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
                     send_reset(s, tw, &twlen);
                 }
             } else if (f.type == TF_END) {
@@ -414,7 +418,7 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
             }
             if (p[k].revents & POLLOUT) {
                 ssize_t w = send(s->fd, s->tobuf + s->tooff, s->tolen - s->tooff, MSG_NOSIGNAL);
-                if (w > 0) { s->tooff += (size_t)w; if (s->tooff == s->tolen) {
+                if (w > 0) { s->tooff += (size_t)w; s->last_flush = now_ms(); if (s->tooff == s->tolen) {
                         s->tooff = s->tolen = 0;
                         if (s->remote_eof && !s->wr_shut) { shutdown(s->fd, SHUT_WR); s->wr_shut = 1; } } }
                 else if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
@@ -469,6 +473,13 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
                 continue;
             }
             if (st[i].local_eof && st[i].remote_eof && st[i].tooff == st[i].tolen) { close_stream(&st[i]); continue; }
+            /* M4: a stream whose local sink has refused every byte for idle_timeout_ms while data
+             * is queued (tooff<tolen) is stuck — its backpressure holds up the shared tunnel for
+             * every other stream. Reset it. A merely-slow-but-progressing sink keeps last_flush
+             * fresh and is NOT reset; this is distinct from the quiet-but-healthy case below. */
+            if (idle_timeout_ms > 0 && st[i].tooff < st[i].tolen && now - st[i].last_flush > idle_timeout_ms) {
+                send_reset(&st[i], tw, &twlen); continue;
+            }
             if (idle_timeout_ms > 0 && now - st[i].last_activity > idle_timeout_ms) {
                 int half_closed = (st[i].remote_eof != st[i].local_eof);
                 if (half_closed || !st[i].activated) send_reset(&st[i], tw, &twlen);   /* stuck, not legit-idle */
