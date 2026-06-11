@@ -8,6 +8,7 @@
 #include "stream.h"
 #include "frame.h"
 #include "sni.h"
+#include "conn.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -133,11 +134,10 @@ static struct stream *open_public(struct stream *st, uint32_t *next_sid, int fd,
     return s;
 }
 
-static int serve_loop(int tfd, int is_relay,
+static int serve_loop(tunnel_conn_t *conn, int is_relay,
                       const tunnel_listener_t *lis, size_t nlis,
                       const tunnel_target_t *fwd, size_t nfwd,
                       const tunnel_sni_route_t *routes, size_t nroutes) {
-    set_nonblock(tfd);
     if (is_relay) for (size_t i = 0; i < nlis; i++) set_nonblock(lis[i].listen_fd);
 
     tunnel_decoder_t dec; tunnel_decoder_reset(&dec);
@@ -161,9 +161,10 @@ static int serve_loop(int tfd, int is_relay,
         struct pollfd p[1 + MAX_LISTENERS + MAX_STREAMS + MAX_PEEKERS];
         struct stream *smap[1 + MAX_LISTENERS + MAX_STREAMS + MAX_PEEKERS];
         struct peeker *pmap[1 + MAX_LISTENERS + MAX_STREAMS + MAX_PEEKERS];
-        p[0].fd = tfd; p[0].events = 0; p[0].revents = 0;
-        if (!backpressured) p[0].events |= POLLIN;
-        if (twoff < twlen)  p[0].events |= POLLOUT;
+        int ssl_more = !backpressured && tunnel_conn_pending(conn);
+        p[0].fd = conn->fd; p[0].events = 0; p[0].revents = 0;
+        if (!backpressured || conn->want_rd)  p[0].events |= POLLIN;
+        if (twoff < twlen   || conn->want_wr) p[0].events |= POLLOUT;
         int np = 1, lis_start = 1;
         if (can_accept)
             for (size_t i = 0; i < nlis; i++) { p[np].fd = lis[i].listen_fd; p[np].events = POLLIN; p[np].revents = 0; np++; }
@@ -185,25 +186,27 @@ static int serve_loop(int tfd, int is_relay,
         int pk_end = np;
         if (p[0].events == 0 && np == lis_end && lis_end == lis_start) break;
 
-        if (poll(p, (nfds_t)np, -1) < 0) { if (errno == EINTR) continue; rc = -1; break; }
+        if (poll(p, (nfds_t)np, ssl_more ? 0 : -1) < 0) { if (errno == EINTR) continue; rc = -1; break; }
 
-        /* --- tunnel out / in --- */
-        if (p[0].revents & POLLOUT) {
-            ssize_t w = send(tfd, tw + twoff, twlen - twoff, MSG_NOSIGNAL);
-            if (w > 0) { twoff += (size_t)w; if (twoff == twlen) twoff = twlen = 0; }
-            else if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) { rc = -1; break; }
-        }
-        if (p[0].revents & (POLLIN | POLLHUP)) {
-            unsigned char tmp[TUNNEL_RECV_CHUNK];
-            ssize_t n = read(tfd, tmp, sizeof tmp);
-            if (n == 0) { rc = 0; break; }
-            if (n < 0) { if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) { rc = -1; break; } }
-            else {
-                size_t pushed = 0;
-                while (pushed < (size_t)n) {
-                    size_t c = tunnel_decoder_push(&dec, tmp + pushed, (size_t)n - pushed);
-                    if (c == 0) { rc = -1; goto done; }
-                    pushed += c;
+        /* --- tunnel (plain fd or SSL) out / in via the non-blocking transport --- */
+        if (ssl_more || (p[0].revents & (POLLIN | POLLOUT | POLLHUP | POLLERR))) {
+            if (twoff < twlen) {
+                long w = tunnel_conn_write(conn, tw + twoff, twlen - twoff);
+                if (w > 0) { twoff += (size_t)w; if (twoff == twlen) twoff = twlen = 0; }
+                else if (w == -1) { rc = -1; break; }
+            }
+            if (!backpressured) {
+                unsigned char tmp[TUNNEL_RECV_CHUNK];
+                long n = tunnel_conn_read(conn, tmp, sizeof tmp);
+                if (n == 0) { rc = 0; break; }
+                else if (n == -1) { rc = -1; break; }
+                else if (n > 0) {
+                    size_t pushed = 0;
+                    while (pushed < (size_t)n) {
+                        size_t c = tunnel_decoder_push(&dec, tmp + pushed, (size_t)n - pushed);
+                        if (c == 0) { rc = -1; goto done; }
+                        pushed += c;
+                    }
                 }
             }
         }
@@ -325,12 +328,25 @@ done:
 }
 
 int tunnel_agent_serve(int tunnel_fd, const tunnel_target_t *forwards, size_t n_forwards) {
-    return serve_loop(tunnel_fd, 0, NULL, 0, forwards, n_forwards, NULL, 0);
+    tunnel_conn_t conn; tunnel_conn_fd(&conn, tunnel_fd);
+    return serve_loop(&conn, 0, NULL, 0, forwards, n_forwards, NULL, 0);
+}
+int tunnel_agent_serve_ssl(SSL *tunnel, const tunnel_target_t *forwards, size_t n_forwards) {
+    tunnel_conn_t conn; tunnel_conn_ssl(&conn, tunnel);
+    return serve_loop(&conn, 0, NULL, 0, forwards, n_forwards, NULL, 0);
 }
 
 int tunnel_relay_serve(int tunnel_fd,
                        const tunnel_listener_t *listeners, size_t n_listeners,
                        const tunnel_sni_route_t *routes, size_t n_routes) {
     if (n_listeners > MAX_LISTENERS) n_listeners = MAX_LISTENERS;
-    return serve_loop(tunnel_fd, 1, listeners, n_listeners, NULL, 0, routes, n_routes);
+    tunnel_conn_t conn; tunnel_conn_fd(&conn, tunnel_fd);
+    return serve_loop(&conn, 1, listeners, n_listeners, NULL, 0, routes, n_routes);
+}
+int tunnel_relay_serve_ssl(SSL *tunnel,
+                           const tunnel_listener_t *listeners, size_t n_listeners,
+                           const tunnel_sni_route_t *routes, size_t n_routes) {
+    if (n_listeners > MAX_LISTENERS) n_listeners = MAX_LISTENERS;
+    tunnel_conn_t conn; tunnel_conn_ssl(&conn, tunnel);
+    return serve_loop(&conn, 1, listeners, n_listeners, NULL, 0, routes, n_routes);
 }

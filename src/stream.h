@@ -12,6 +12,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <openssl/ssl.h>
 
 /* Where forward_id N points: the local TCP service the agent dials for that forward. */
 typedef struct {
@@ -24,6 +25,9 @@ typedef struct {
  * its TLS connection). On OPEN, dial forwards[forward_id]. Runs until the tunnel
  * closes. Returns 0 on clean tunnel EOF, -1 on error. */
 int tunnel_agent_serve(int tunnel_fd, const tunnel_target_t *forwards, size_t n_forwards);
+
+/* Same, but the tunnel is an established TLS connection (the production transport). */
+int tunnel_agent_serve_ssl(SSL *tunnel, const tunnel_target_t *forwards, size_t n_forwards);
 
 /* A relay listener (§3.1). When `sni` is 0 it's a tcp port-forward: every connection
  * opens a stream tagged with `forward_id`. When `sni` is 1 it's the shared :443 path:
@@ -47,5 +51,10 @@ typedef struct {
 int tunnel_relay_serve(int tunnel_fd,
                        const tunnel_listener_t *listeners, size_t n_listeners,
                        const tunnel_sni_route_t *routes, size_t n_routes);
+
+/* Same, but the tunnel toward the agent is an established TLS connection. */
+int tunnel_relay_serve_ssl(SSL *tunnel,
+                           const tunnel_listener_t *listeners, size_t n_listeners,
+                           const tunnel_sni_route_t *routes, size_t n_routes);
 
 #endif /* PORTICO_TUNNEL_STREAM_H */
