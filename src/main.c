@@ -43,11 +43,37 @@ static int bind_listen(int port) {
     return fd;
 }
 
-/* split "host:port" in place into host and port pointers; returns 0, or -1. */
+/* L2: parse a numeric CLI value with full validation (no silent atoi truncation). */
+static long parse_num(const char *s, long lo, long hi, const char *flag) {
+    char *end; errno = 0;
+    long v = strtol(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0' || v < lo || v > hi) {
+        fprintf(stderr, "portico-tunnel: %s: invalid value '%s' (want %ld..%ld)\n", flag, s, lo, hi);
+        exit(2);
+    }
+    return v;
+}
+static int parse_port(const char *s, const char *flag) { return (int)parse_num(s, 1, 65535, flag); }
+static int parse_secs(const char *s, const char *flag) { return (int)parse_num(s, 0, 86400, flag); }
+
+/* L3: split "host:port" / "[v6]:port" in place. Brackets are required for IPv6 literals;
+ * an ambiguous bare multi-colon address, an empty host, or a non-numeric/empty port is an
+ * error rather than a silently mis-split or dial-time failure. Returns 0 or -1. */
 static int hostport(char *s, char **host, char **port) {
-    char *c = strrchr(s, ':');
-    if (!c) return -1;
-    *c = '\0'; *host = s; *port = c + 1;
+    char *c;
+    if (*s == '[') {                                       /* [IPv6]:port */
+        char *rb = strchr(s, ']');
+        if (!rb || rb[1] != ':') return -1;
+        *rb = '\0'; *host = s + 1; c = rb + 1; *port = c + 1;
+    } else {
+        c = strchr(s, ':');
+        if (!c || strchr(c + 1, ':')) return -1;           /* missing, or bare IPv6 -> require brackets */
+        *c = '\0'; *host = s; *port = c + 1;
+    }
+    if (**host == '\0' || **port == '\0') return -1;       /* empty host or port */
+    char *end; errno = 0;
+    long pv = strtol(*port, &end, 10);
+    if (errno != 0 || *end != '\0' || pv < 1 || pv > 65535) return -1;   /* numeric 1..65535 */
     return 0;
 }
 
@@ -74,15 +100,15 @@ static int run_relay(int argc, char **argv) {
     int sni_fd = -1;
 
     for (int i = 2; i < argc; i++) {
-        if      (!strcmp(argv[i], "--control-port")) control_port = atoi(opt(argc, argv, &i, "--control-port"));
-        else if (!strcmp(argv[i], "--https-port"))   https_port   = atoi(opt(argc, argv, &i, "--https-port"));
+        if      (!strcmp(argv[i], "--control-port")) control_port = parse_port(opt(argc, argv, &i, "--control-port"), "--control-port");
+        else if (!strcmp(argv[i], "--https-port"))   https_port   = parse_port(opt(argc, argv, &i, "--https-port"), "--https-port");
         else if (!strcmp(argv[i], "--cert"))         cert      = opt(argc, argv, &i, "--cert");
         else if (!strcmp(argv[i], "--key"))          key       = opt(argc, argv, &i, "--key");
         else if (!strcmp(argv[i], "--client-ca"))    client_ca = opt(argc, argv, &i, "--client-ca");
-        else if (!strcmp(argv[i], "--hb"))           hb = atoi(opt(argc, argv, &i, "--hb"));
+        else if (!strcmp(argv[i], "--hb"))           hb = parse_secs(opt(argc, argv, &i, "--hb"), "--hb");
         else if (!strcmp(argv[i], "--tcp")) {
             if (nlis >= MAX_FWD) { fprintf(stderr, "too many forwards\n"); return 2; }
-            int rport = atoi(opt(argc, argv, &i, "--tcp"));
+            int rport = parse_port(opt(argc, argv, &i, "--tcp"), "--tcp");
             int fd = bind_listen(rport); if (fd < 0) return 1;
             lis[nlis].listen_fd = fd; lis[nlis].sni = 0; lis[nlis].forward_id = next_fwd++; nlis++;
         }
@@ -126,7 +152,7 @@ static int run_agent(int argc, char **argv) {
         else if (!strcmp(argv[i], "--cert")) cert = opt(argc, argv, &i, "--cert");
         else if (!strcmp(argv[i], "--key"))  key  = opt(argc, argv, &i, "--key");
         else if (!strcmp(argv[i], "--id"))   id   = opt(argc, argv, &i, "--id");
-        else if (!strcmp(argv[i], "--hb"))   hb   = atoi(opt(argc, argv, &i, "--hb"));
+        else if (!strcmp(argv[i], "--hb"))   hb   = parse_secs(opt(argc, argv, &i, "--hb"), "--hb");
         else if (!strcmp(argv[i], "--forward")) {
             if (nfwd >= MAX_FWD) { fprintf(stderr, "too many forwards\n"); return 2; }
             char *t = (char *)opt(argc, argv, &i, "--forward"), *h, *p;

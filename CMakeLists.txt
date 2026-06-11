@@ -145,6 +145,9 @@ if(TUNNEL_BUILD_TESTS)
     # CLI integration: run the actual binary (relay + agent) and tunnel a tcp forward.
     add_test(NAME cli COMMAND bash ${CMAKE_SOURCE_DIR}/tests/cli_test.sh $<TARGET_FILE:portico-tunnel>)
 
+    # L2/L3: the CLI rejects malformed numeric args and host:port specs up front.
+    add_test(NAME cli_args COMMAND bash ${CMAKE_SOURCE_DIR}/tests/cli_args_test.sh $<TARGET_FILE:portico-tunnel>)
+
     # TLS SNI peek: parse real OpenSSL ClientHellos + hostile inputs.
     add_executable(sni_test tests/sni_test.c)
     target_link_libraries(sni_test PRIVATE tunnel)
