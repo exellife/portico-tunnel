@@ -92,6 +92,7 @@ typedef struct {
     int       (*allow)(const char *agent_id, const char *hostname, void *ud);
     void       *allow_ud;
     int         heartbeat_secs;          /* 0 -> 20 */
+    int         handshake_timeout_ms;    /* deadline for an agent's TLS handshake + HELLO; 0 -> 10000 */
     atomic_int *stop;
 } tunnel_relay_run_config_t;
 

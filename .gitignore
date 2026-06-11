@@ -3,3 +3,6 @@ build-*/
 *.o
 *.a
 compile_commands.json
+
+# local security review (uncommitted)
+SECURITY_REVIEW.md

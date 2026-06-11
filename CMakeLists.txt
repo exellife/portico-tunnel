@@ -92,6 +92,11 @@ if(TUNNEL_BUILD_TESTS)
     target_link_libraries(reconnect_test PRIVATE tunnel)
     add_test(NAME reconnect COMMAND reconnect_test)
 
+    # H1: relay control handshake/HELLO deadline — a staller cannot freeze the relay.
+    add_executable(relay_deadline_test tests/relay_deadline_test.c)
+    target_link_libraries(relay_deadline_test PRIVATE tunnel)
+    add_test(NAME relay_deadline COMMAND relay_deadline_test)
+
     # CLI integration: run the actual binary (relay + agent) and tunnel a tcp forward.
     add_test(NAME cli COMMAND bash ${CMAKE_SOURCE_DIR}/tests/cli_test.sh $<TARGET_FILE:portico-tunnel>)
 

@@ -13,6 +13,7 @@
 #include "control.h"
 
 #include <time.h>
+#include <sys/time.h>
 
 #include <stdio.h>
 #include <string.h>
@@ -379,13 +380,21 @@ static void backoff_sleep(int ms, const tunnel_agent_run_config_t *cfg) {
 }
 
 int tunnel_relay_run(const tunnel_relay_run_config_t *cfg) {
-    int hb = cfg->heartbeat_secs > 0 ? cfg->heartbeat_secs : 20;
+    int hb   = cfg->heartbeat_secs > 0 ? cfg->heartbeat_secs : 20;
+    int hsto = cfg->handshake_timeout_ms > 0 ? cfg->handshake_timeout_ms : 10000;
     while (!(cfg->stop && atomic_load(cfg->stop))) {
         struct pollfd pf = { cfg->control_fd, POLLIN, 0 };
         int pr = poll(&pf, 1, 500);                  /* timeout -> re-check the stop flag */
         if (pr <= 0) continue;
         int c = accept(cfg->control_fd, NULL, NULL);
         if (c < 0) continue;
+
+        /* Bound the TLS handshake AND the HELLO read so a stalled/idle peer cannot
+         * freeze the (serial) control path. Both run as blocking ops on this fd until
+         * serve makes it non-blocking, so a recv/send timeout caps them. */
+        struct timeval tv = { hsto / 1000, (hsto % 1000) * 1000 };
+        setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
 
         tunnel_tls_t tls;
         if (tunnel_tls_accept(c, cfg->cert, cfg->key, cfg->client_ca, &tls) != 0) { close(c); continue; }
