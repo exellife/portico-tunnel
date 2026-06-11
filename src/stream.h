@@ -74,6 +74,7 @@ typedef struct {
     int         backoff_min_ms;          /* 0 -> 500 */
     int         backoff_max_ms;          /* 0 -> 30000 */
     int         register_timeout_ms;     /* deadline for the HELLO exchange; 0 -> 10000 */
+    int         idle_timeout_ms;         /* reap stuck/half-open/never-active streams; 0 -> 60000 */
     atomic_int *stop;                    /* optional: set nonzero to stop the loop */
 } tunnel_agent_run_config_t;
 
@@ -94,6 +95,7 @@ typedef struct {
     void       *allow_ud;
     int         heartbeat_secs;          /* 0 -> 20 */
     int         handshake_timeout_ms;    /* deadline for an agent's TLS handshake + HELLO; 0 -> 10000 */
+    int         idle_timeout_ms;         /* reap idle peekers + stuck/half-open/never-active streams; 0 -> 30000 */
     atomic_int *stop;
 } tunnel_relay_run_config_t;
 

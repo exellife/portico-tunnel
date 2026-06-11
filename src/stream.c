@@ -44,6 +44,8 @@ struct stream {
     int      remote_eof, local_eof, wr_shut;
     int      connecting;       /* agent: the local target connect() is still in flight */
     long     connect_deadline; /* monotonic ms by which the connect must complete */
+    long     last_activity;    /* monotonic ms of the last byte moved (or creation) */
+    int      activated;        /* has any byte ever flowed on this stream? */
 };
 
 #define CONNECT_TIMEOUT_MS 10000
@@ -59,6 +61,7 @@ struct peeker {                                  /* relay: accepted, awaiting SN
     int      fd;
     unsigned char buf[PEEK_CAP];
     size_t   len;
+    long     since;                              /* monotonic ms of accept / last byte */
 };
 
 static void set_nonblock(int fd) {
@@ -112,7 +115,12 @@ static struct stream *find_stream(struct stream *st, uint32_t sid) {
 }
 static struct stream *alloc_stream(struct stream *st, uint32_t sid) {
     for (int i = 0; i < MAX_STREAMS; i++)
-        if (!st[i].active) { memset(&st[i], 0, sizeof st[i]); st[i].active = 1; st[i].sid = sid; st[i].fd = -1; return &st[i]; }
+        if (!st[i].active) {
+            memset(&st[i], 0, sizeof st[i]);
+            st[i].active = 1; st[i].sid = sid; st[i].fd = -1;
+            st[i].last_activity = now_ms();
+            return &st[i];
+        }
     return NULL;
 }
 static int tw_frame(unsigned char *tw, size_t *twlen, uint8_t type, uint32_t sid,
@@ -159,7 +167,7 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
                       const tunnel_listener_t *lis, size_t nlis,
                       const tunnel_target_t *fwd, size_t nfwd,
                       const tunnel_sni_route_t *routes, size_t nroutes,
-                      int heartbeat_secs) {
+                      int heartbeat_secs, int idle_timeout_ms) {
     if (is_relay) for (size_t i = 0; i < nlis; i++) set_nonblock(lis[i].listen_fd);
 
     tunnel_decoder_t dec; tunnel_decoder_reset(&dec);
@@ -177,20 +185,25 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
             if (st[i].active && st[i].connecting) any_connecting = 1;
         }
         for (int i = 0; i < MAX_PEEKERS; i++) if (!pk[i].active) { has_peeker = 1; break; }
-        int can_accept = is_relay && has_free && has_peeker && !backpressured &&
-                         (twlen + TUNNEL_FRAME_HDR + OPEN_HDR <= TW_CAP);
+        int tw_room_open = (twlen + TUNNEL_FRAME_HDR + OPEN_HDR <= TW_CAP);
+        int can_accept_tcp = is_relay && has_free && !backpressured && tw_room_open;
+        int can_accept_sni = can_accept_tcp && has_peeker;   /* sni needs a peeker slot; tcp does not */
         int can_peek = has_free && (twlen + PEEK_ROOM <= TW_CAP);
 
         struct pollfd p[1 + MAX_LISTENERS + MAX_STREAMS + MAX_PEEKERS];
         struct stream *smap[1 + MAX_LISTENERS + MAX_STREAMS + MAX_PEEKERS];
         struct peeker *pmap[1 + MAX_LISTENERS + MAX_STREAMS + MAX_PEEKERS];
+        int            lmap[1 + MAX_LISTENERS];   /* pollfd index -> listener index */
         int ssl_more = !backpressured && tunnel_conn_pending(conn);
         p[0].fd = conn->fd; p[0].events = 0; p[0].revents = 0;
         if (!backpressured || conn->want_rd)  p[0].events |= POLLIN;
         if (twoff < twlen   || conn->want_wr) p[0].events |= POLLOUT;
         int np = 1, lis_start = 1;
-        if (can_accept)
-            for (size_t i = 0; i < nlis; i++) { p[np].fd = lis[i].listen_fd; p[np].events = POLLIN; p[np].revents = 0; np++; }
+        for (size_t i = 0; i < nlis; i++) {
+            int gate = lis[i].sni ? can_accept_sni : can_accept_tcp;   /* tcp forwards don't need a free peeker */
+            if (!gate) continue;
+            p[np].fd = lis[i].listen_fd; p[np].events = POLLIN; p[np].revents = 0; lmap[np] = (int)i; np++;
+        }
         int lis_end = np, str_start = np;
         for (int i = 0; i < MAX_STREAMS; i++) {
             if (!st[i].active || st[i].fd < 0) continue;
@@ -215,6 +228,10 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
 
         int base = heartbeat_secs > 0 ? heartbeat_secs * 1000 : -1;
         if (any_connecting && (base < 0 || base > 250)) base = 250;   /* wake to enforce connect deadlines */
+        if (idle_timeout_ms > 0) {                                    /* wake to run the idle/slowloris sweep */
+            int sweep = idle_timeout_ms / 2; if (sweep < 100) sweep = 100; if (sweep > 1000) sweep = 1000;
+            if (base < 0 || base > sweep) base = sweep;
+        }
         int timeout = ssl_more ? 0 : base;
         int pr = poll(p, (nfds_t)np, timeout);
         if (pr < 0) { if (errno == EINTR) continue; rc = -1; break; }
@@ -274,6 +291,7 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
             struct stream *s = find_stream(st, f.stream_id);
             if (f.type == TF_DATA) {
                 if (!s) continue;
+                s->last_activity = now_ms(); s->activated = 1;
                 memcpy(s->tobuf, f.payload, f.len);
                 s->tolen = f.len; s->tooff = 0;
                 ssize_t w = (f.len ? send(s->fd, s->tobuf, s->tolen, MSG_NOSIGNAL) : 0);
@@ -289,11 +307,11 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
             }
         }
 
-        /* --- relay: accept new public connections --- */
-        if (can_accept) {
+        /* --- relay: accept new public connections (per-listener gated in the poll-set) --- */
+        {
             for (int idx = lis_start; idx < lis_end; idx++) {
                 if (!(p[idx].revents & POLLIN)) continue;
-                const tunnel_listener_t *L = &lis[idx - lis_start];
+                const tunnel_listener_t *L = &lis[lmap[idx]];
                 for (;;) {
                     int c = accept(L->listen_fd, NULL, NULL);
                     if (c < 0) break;
@@ -301,7 +319,7 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
                     if (L->sni) {                                  /* defer until ClientHello peeked */
                         int placed = 0;
                         for (int j = 0; j < MAX_PEEKERS; j++)
-                            if (!pk[j].active) { pk[j].active = 1; pk[j].fd = c; pk[j].len = 0; placed = 1; break; }
+                            if (!pk[j].active) { pk[j].active = 1; pk[j].fd = c; pk[j].len = 0; pk[j].since = now_ms(); placed = 1; break; }
                         if (!placed) { close(c); break; }
                     } else if (!open_public(st, &next_sid, c, L->forward_id, NULL, 0, tw, &twlen)) {
                         break;
@@ -336,7 +354,8 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
             if (s->active && (p[k].revents & (POLLIN | POLLHUP))) {
                 unsigned char tmp[TUNNEL_MAX_FRAME];
                 ssize_t n = read(s->fd, tmp, sizeof tmp);
-                if (n > 0) { if (tw_frame(tw, &twlen, TF_DATA, s->sid, tmp, (uint32_t)n) < 0) { rc = -1; goto done; } }
+                if (n > 0) { s->last_activity = now_ms(); s->activated = 1;
+                    if (tw_frame(tw, &twlen, TF_DATA, s->sid, tmp, (uint32_t)n) < 0) { rc = -1; goto done; } }
                 else if (n == 0) { tw_frame(tw, &twlen, TF_END, s->sid, NULL, 0); s->local_eof = 1; }
                 else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
                     tw_frame(tw, &twlen, TF_RESET, s->sid, NULL, 0); close_stream(s);
@@ -350,7 +369,7 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
             if (!q->active || !(p[k].revents & (POLLIN | POLLHUP))) continue;
             ssize_t n = read(q->fd, q->buf + q->len, PEEK_CAP - q->len);
             if (n <= 0) { if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) { close(q->fd); q->active = 0; } continue; }
-            q->len += (size_t)n;
+            q->len += (size_t)n; q->since = now_ms();
             char host[256];
             int r = tunnel_sni_peek(q->buf, q->len, host, sizeof host);
             if (r == 0) { if (q->len >= PEEK_CAP) { close(q->fd); q->active = 0; } continue; }
@@ -362,16 +381,27 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
             open_public(st, &next_sid, fd, fid, q->buf, q->len, tw, &twlen);
         }
 
-        /* --- reap finished streams + time out stuck connects --- */
-        long t = any_connecting ? now_ms() : 0;
+        /* --- reap: finished streams, stuck connects, idle peekers, and stuck streams
+         *     (never-active or half-closed-lingering). A fully-open stream that has had
+         *     activity and is merely quiet is NEVER reaped (legit idle, e.g. SSH). --- */
+        long now = (any_connecting || idle_timeout_ms > 0) ? now_ms() : 0;
         for (int i = 0; i < MAX_STREAMS; i++) {
             if (!st[i].active) continue;
-            if (st[i].connecting && t >= st[i].connect_deadline) {   /* local target never came up */
-                tw_frame(tw, &twlen, TF_RESET, st[i].sid, NULL, 0); close_stream(&st[i]); continue;
+            if (st[i].connecting) {                                   /* local target never came up */
+                if (now >= st[i].connect_deadline) { tw_frame(tw, &twlen, TF_RESET, st[i].sid, NULL, 0); close_stream(&st[i]); }
+                continue;
             }
-            if (st[i].local_eof && st[i].remote_eof && st[i].tooff == st[i].tolen)
-                close_stream(&st[i]);
+            if (st[i].local_eof && st[i].remote_eof && st[i].tooff == st[i].tolen) { close_stream(&st[i]); continue; }
+            if (idle_timeout_ms > 0 && now - st[i].last_activity > idle_timeout_ms) {
+                int half_closed = (st[i].remote_eof != st[i].local_eof);
+                if (half_closed || !st[i].activated) {                /* stuck, not legit-idle */
+                    tw_frame(tw, &twlen, TF_RESET, st[i].sid, NULL, 0); close_stream(&st[i]);
+                }
+            }
         }
+        if (idle_timeout_ms > 0)
+            for (int i = 0; i < MAX_PEEKERS; i++)
+                if (pk[i].active && now - pk[i].since > idle_timeout_ms) { close(pk[i].fd); pk[i].active = 0; }
     }
 
 done:
@@ -382,11 +412,11 @@ done:
 
 int tunnel_agent_serve(int tunnel_fd, const tunnel_target_t *forwards, size_t n_forwards) {
     tunnel_conn_t conn; tunnel_conn_fd(&conn, tunnel_fd);
-    return serve_loop(&conn, 0, NULL, 0, forwards, n_forwards, NULL, 0, 0);
+    return serve_loop(&conn, 0, NULL, 0, forwards, n_forwards, NULL, 0, 0, 0);
 }
 int tunnel_agent_serve_ssl(SSL *tunnel, const tunnel_target_t *forwards, size_t n_forwards) {
     tunnel_conn_t conn; tunnel_conn_ssl(&conn, tunnel);
-    return serve_loop(&conn, 0, NULL, 0, forwards, n_forwards, NULL, 0, 0);
+    return serve_loop(&conn, 0, NULL, 0, forwards, n_forwards, NULL, 0, 0, 0);
 }
 
 int tunnel_relay_serve(int tunnel_fd,
@@ -394,14 +424,14 @@ int tunnel_relay_serve(int tunnel_fd,
                        const tunnel_sni_route_t *routes, size_t n_routes) {
     if (n_listeners > MAX_LISTENERS) n_listeners = MAX_LISTENERS;
     tunnel_conn_t conn; tunnel_conn_fd(&conn, tunnel_fd);
-    return serve_loop(&conn, 1, listeners, n_listeners, NULL, 0, routes, n_routes, 0);
+    return serve_loop(&conn, 1, listeners, n_listeners, NULL, 0, routes, n_routes, 0, 0);
 }
 int tunnel_relay_serve_ssl(SSL *tunnel,
                            const tunnel_listener_t *listeners, size_t n_listeners,
                            const tunnel_sni_route_t *routes, size_t n_routes) {
     if (n_listeners > MAX_LISTENERS) n_listeners = MAX_LISTENERS;
     tunnel_conn_t conn; tunnel_conn_ssl(&conn, tunnel);
-    return serve_loop(&conn, 1, listeners, n_listeners, NULL, 0, routes, n_routes, 0);
+    return serve_loop(&conn, 1, listeners, n_listeners, NULL, 0, routes, n_routes, 0, 0);
 }
 
 /* ---- the agent run loop: connect -> register -> serve -> reconnect ---------- */
@@ -444,7 +474,8 @@ int tunnel_relay_run(const tunnel_relay_run_config_t *cfg) {
         tunnel_hello_t h; char err[256];
         if (tunnel_relay_accept(&io, &rdec, &h, cfg->allow, cfg->allow_ud, err, sizeof err) == 0) {
             tunnel_conn_t conn; tunnel_conn_ssl(&conn, tls.ssl);
-            serve_loop(&conn, 1, cfg->listeners, cfg->n_listeners, NULL, 0, cfg->routes, cfg->n_routes, hb);
+            int idle = cfg->idle_timeout_ms > 0 ? cfg->idle_timeout_ms : 30000;
+            serve_loop(&conn, 1, cfg->listeners, cfg->n_listeners, NULL, 0, cfg->routes, cfg->n_routes, hb, idle);
         } else {
             fprintf(stderr, "relay: agent rejected: %s\n", err);
         }
@@ -488,7 +519,8 @@ int tunnel_agent_run(const tunnel_agent_run_config_t *cfg) {
         backoff = bmin;                              /* a real session resets the backoff */
 
         tunnel_conn_t conn; tunnel_conn_ssl(&conn, tls.ssl);
-        serve_loop(&conn, 0, NULL, 0, cfg->forwards, cfg->n_forwards, NULL, 0, hb);
+        int idle = cfg->idle_timeout_ms > 0 ? cfg->idle_timeout_ms : 60000;
+        serve_loop(&conn, 0, NULL, 0, cfg->forwards, cfg->n_forwards, NULL, 0, hb, idle);
         tunnel_tls_free(&tls);                        /* tunnel ended — reconnect */
 
     retry:

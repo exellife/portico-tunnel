@@ -107,6 +107,11 @@ if(TUNNEL_BUILD_TESTS)
     target_link_libraries(connect_test PRIVATE tunnel)
     add_test(NAME connect COMMAND connect_test)
 
+    # W2: idle reaping — slowloris peekers reaped, tcp decoupled, healthy-idle preserved.
+    add_executable(idle_reaping_test tests/idle_reaping_test.c)
+    target_link_libraries(idle_reaping_test PRIVATE tunnel)
+    add_test(NAME idle_reaping COMMAND idle_reaping_test)
+
     # CLI integration: run the actual binary (relay + agent) and tunnel a tcp forward.
     add_test(NAME cli COMMAND bash ${CMAKE_SOURCE_DIR}/tests/cli_test.sh $<TARGET_FILE:portico-tunnel>)
 
