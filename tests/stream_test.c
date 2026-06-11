@@ -7,6 +7,7 @@
 #include "frame.h"
 
 #include <stdio.h>
+#include <signal.h>
 #include <string.h>
 #include <stdint.h>
 #include <unistd.h>
@@ -99,6 +100,7 @@ static void *wr_thread(void *p) {
 }
 
 int main(void) {
+    signal(SIGPIPE, SIG_IGN);
     printf("== tunnel agent stream engine ==\n");
 
     struct echo_srv echo;

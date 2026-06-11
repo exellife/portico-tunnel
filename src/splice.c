@@ -29,7 +29,7 @@ static void set_nonblock(int fd) {
 /* Push buffered bytes toward dst. 0 = ok (possibly partial / EAGAIN), -1 = fatal. */
 static int half_flush(struct half *h, long *moved) {
     while (h->off < h->len) {
-        ssize_t n = write(h->dst, h->buf + h->off, h->len - h->off);
+        ssize_t n = send(h->dst, h->buf + h->off, h->len - h->off, MSG_NOSIGNAL);
         if (n > 0) { h->off += (size_t)n; *moved += n; continue; }
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
         if (n < 0 && errno == EINTR) continue;

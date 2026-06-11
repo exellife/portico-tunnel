@@ -69,4 +69,9 @@ if(TUNNEL_BUILD_TESTS)
     add_executable(stream_test tests/stream_test.c)
     target_link_libraries(stream_test PRIVATE tunnel)
     add_test(NAME stream COMMAND stream_test)
+
+    # Relay <-> agent end to end: public client -> relay -> tunnel -> agent -> echo.
+    add_executable(relay_test tests/relay_test.c)
+    target_link_libraries(relay_test PRIVATE tunnel)
+    add_test(NAME relay COMMAND relay_test)
 endif()

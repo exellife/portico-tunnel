@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
+#include <sys/socket.h>
 
 /* ---- raw fd backend ---- */
 
@@ -20,7 +21,7 @@ static long fd_send(void *ctx, const void *buf, size_t n) {
     size_t off = 0;
     while (off < n) {
         ssize_t w;
-        do { w = write(fd, p + off, n - off); } while (w < 0 && errno == EINTR);
+        do { w = send(fd, p + off, n - off, MSG_NOSIGNAL); } while (w < 0 && errno == EINTR);
         if (w <= 0) return -1;
         off += (size_t)w;
     }
