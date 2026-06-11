@@ -90,8 +90,9 @@ int tunnel_relay_accept(tunnel_io_t *io, tunnel_decoder_t *dec, tunnel_hello_t *
 
         tunnel_hello_t h;
         if (tunnel_hello_parse(f.payload, f.len, &h) != 0) return refuse(io, err, errcap, "malformed HELLO");
-        if (h.n_hosts == 0) return refuse(io, err, errcap, "no hostnames");
-
+        /* Zero hostnames is fine — a pure tcp-forward agent declares none (the relay
+         * routes by its own config; mTLS is the trust gate). hostnames, when present,
+         * are still authorized below. */
         for (size_t i = 0; i < h.n_hosts; i++) {
             if (allow && !allow(h.agent_id, h.hostnames[i], ud)) {
                 char m[300];

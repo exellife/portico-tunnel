@@ -78,4 +78,23 @@ typedef struct {
 
 int tunnel_agent_run(const tunnel_agent_run_config_t *cfg);
 
+/* ---- the relay run loop ----------------------------------------------------
+ * Accept agent tunnels on a pre-bound control socket (mTLS), authorize each via
+ * allow(), then serve its registered forwards over the pre-bound public listeners,
+ * looping so a dropped agent is simply re-accepted. Runs until *stop is set. */
+typedef struct {
+    int         control_fd;              /* pre-bound listening socket agents dial */
+    const char *cert, *key, *client_ca;  /* relay server cert/key + CA verifying agents */
+    const tunnel_listener_t  *listeners; /* pre-bound public listeners (tcp/sni) */
+    size_t      n_listeners;
+    const tunnel_sni_route_t *routes;    /* SNI host -> forward_id */
+    size_t      n_routes;
+    int       (*allow)(const char *agent_id, const char *hostname, void *ud);
+    void       *allow_ud;
+    int         heartbeat_secs;          /* 0 -> 20 */
+    atomic_int *stop;
+} tunnel_relay_run_config_t;
+
+int tunnel_relay_run(const tunnel_relay_run_config_t *cfg);
+
 #endif /* PORTICO_TUNNEL_STREAM_H */

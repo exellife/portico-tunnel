@@ -378,6 +378,31 @@ static void backoff_sleep(int ms, const tunnel_agent_run_config_t *cfg) {
     }
 }
 
+int tunnel_relay_run(const tunnel_relay_run_config_t *cfg) {
+    int hb = cfg->heartbeat_secs > 0 ? cfg->heartbeat_secs : 20;
+    while (!(cfg->stop && atomic_load(cfg->stop))) {
+        struct pollfd pf = { cfg->control_fd, POLLIN, 0 };
+        int pr = poll(&pf, 1, 500);                  /* timeout -> re-check the stop flag */
+        if (pr <= 0) continue;
+        int c = accept(cfg->control_fd, NULL, NULL);
+        if (c < 0) continue;
+
+        tunnel_tls_t tls;
+        if (tunnel_tls_accept(c, cfg->cert, cfg->key, cfg->client_ca, &tls) != 0) { close(c); continue; }
+        tunnel_io_t io = tunnel_io_tls(&tls);
+        tunnel_decoder_t rdec; tunnel_decoder_reset(&rdec);
+        tunnel_hello_t h; char err[256];
+        if (tunnel_relay_accept(&io, &rdec, &h, cfg->allow, cfg->allow_ud, err, sizeof err) == 0) {
+            tunnel_conn_t conn; tunnel_conn_ssl(&conn, tls.ssl);
+            serve_loop(&conn, 1, cfg->listeners, cfg->n_listeners, NULL, 0, cfg->routes, cfg->n_routes, hb);
+        } else {
+            fprintf(stderr, "relay: agent rejected: %s\n", err);
+        }
+        tunnel_tls_free(&tls);                        /* agent gone — accept the next one */
+    }
+    return 0;
+}
+
 int tunnel_agent_run(const tunnel_agent_run_config_t *cfg) {
     int hb   = cfg->heartbeat_secs  > 0 ? cfg->heartbeat_secs  : 20;
     int bmin = cfg->backoff_min_ms  > 0 ? cfg->backoff_min_ms  : 500;

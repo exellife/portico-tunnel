@@ -40,6 +40,11 @@ target_include_directories(tunnel PUBLIC src)
 target_compile_options(tunnel PRIVATE -Wall -Wextra -Wno-unused-parameter)
 target_link_libraries(tunnel PUBLIC Threads::Threads OpenSSL::SSL OpenSSL::Crypto)
 
+# --- the runnable binary ---
+add_executable(portico-tunnel src/main.c)
+target_compile_options(portico-tunnel PRIVATE -Wall -Wextra)
+target_link_libraries(portico-tunnel PRIVATE tunnel)
+
 # --- tests ---
 option(TUNNEL_BUILD_TESTS "Build tests" ON)
 if(TUNNEL_BUILD_TESTS)
@@ -86,6 +91,9 @@ if(TUNNEL_BUILD_TESTS)
     add_executable(reconnect_test tests/reconnect_test.c)
     target_link_libraries(reconnect_test PRIVATE tunnel)
     add_test(NAME reconnect COMMAND reconnect_test)
+
+    # CLI integration: run the actual binary (relay + agent) and tunnel a tcp forward.
+    add_test(NAME cli COMMAND bash ${CMAKE_SOURCE_DIR}/tests/cli_test.sh $<TARGET_FILE:portico-tunnel>)
 
     # TLS SNI peek: parse real OpenSSL ClientHellos + hostile inputs.
     add_executable(sni_test tests/sni_test.c)
