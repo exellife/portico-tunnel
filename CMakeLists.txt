@@ -33,7 +33,8 @@ add_library(tunnel STATIC
     src/io.c
     src/control.c
     src/tls.c
-    src/stream.c)
+    src/stream.c
+    src/sni.c)
 target_include_directories(tunnel PUBLIC src)
 target_compile_options(tunnel PRIVATE -Wall -Wextra -Wno-unused-parameter)
 target_link_libraries(tunnel PUBLIC Threads::Threads OpenSSL::SSL OpenSSL::Crypto)
@@ -74,4 +75,9 @@ if(TUNNEL_BUILD_TESTS)
     add_executable(relay_test tests/relay_test.c)
     target_link_libraries(relay_test PRIVATE tunnel)
     add_test(NAME relay COMMAND relay_test)
+
+    # TLS SNI peek: parse real OpenSSL ClientHellos + hostile inputs.
+    add_executable(sni_test tests/sni_test.c)
+    target_link_libraries(sni_test PRIVATE tunnel)
+    add_test(NAME sni COMMAND sni_test)
 endif()
