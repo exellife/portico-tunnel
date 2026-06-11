@@ -87,7 +87,8 @@ static void usage(void) {
           "  portico-tunnel --relay --control-port N --cert F --key F --client-ca F\n"
           "                 [--https-port N] [--tcp RPORT]... [--sni HOST]... [--hb SECS]\n"
           "  portico-tunnel --agent --relay-addr HOST:PORT --ca F --cert F --key F\n"
-          "                 [--id NAME] --forward LOCALHOST:PORT... [--host NAME]... [--hb SECS]\n",
+          "                 [--id NAME] --forward [tcp:|sni:]LOCALHOST:PORT... [--host NAME]... [--hb SECS]\n"
+          "  (forward N's [tcp:|sni:] kind must match the relay's N-th --tcp/--sni; checked at registration)\n",
           stderr);
 }
 
@@ -96,6 +97,7 @@ static int run_relay(int argc, char **argv) {
     const char *cert = NULL, *key = NULL, *client_ca = NULL;
     static tunnel_listener_t lis[MAX_FWD + 1]; size_t nlis = 0;
     static tunnel_sni_route_t routes[MAX_FWD]; size_t nroutes = 0;
+    static uint8_t fwd_kinds[MAX_FWD];          /* M7: kind by forward_id, in declaration order */
     uint32_t next_fwd = 0;
     int sni_fd = -1;
 
@@ -110,6 +112,7 @@ static int run_relay(int argc, char **argv) {
             if (nlis >= MAX_FWD) { fprintf(stderr, "too many forwards\n"); return 2; }
             int rport = parse_port(opt(argc, argv, &i, "--tcp"), "--tcp");
             int fd = bind_listen(rport); if (fd < 0) return 1;
+            fwd_kinds[next_fwd] = TUNNEL_FWD_TCP;
             lis[nlis].listen_fd = fd; lis[nlis].sni = 0; lis[nlis].forward_id = next_fwd++; nlis++;
         }
         else if (!strcmp(argv[i], "--sni")) {
@@ -119,6 +122,7 @@ static int run_relay(int argc, char **argv) {
                 lis[nlis].listen_fd = sni_fd; lis[nlis].sni = 1; lis[nlis].forward_id = 0; nlis++;
             }
             if (nroutes >= MAX_FWD) { fprintf(stderr, "too many forwards\n"); return 2; }
+            fwd_kinds[next_fwd] = TUNNEL_FWD_SNI;
             routes[nroutes].host = host; routes[nroutes].forward_id = next_fwd++; nroutes++;
         }
         else { fprintf(stderr, "portico-tunnel: unknown relay option %s\n", argv[i]); usage(); return 2; }
@@ -134,6 +138,7 @@ static int run_relay(int argc, char **argv) {
     tunnel_relay_run_config_t cfg = {
         .control_fd = ctrl, .cert = cert, .key = key, .client_ca = client_ca,
         .listeners = lis, .n_listeners = nlis, .routes = routes, .n_routes = nroutes,
+        .forward_kinds = fwd_kinds, .n_forwards = next_fwd,
         .allow = allow_all, .heartbeat_secs = hb, .stop = &stop,
     };
     fprintf(stderr, "portico-tunnel relay: agents on :%d, %u forward(s)\n", control_port, next_fwd);
@@ -156,9 +161,15 @@ static int run_agent(int argc, char **argv) {
         else if (!strcmp(argv[i], "--forward")) {
             if (nfwd >= MAX_FWD) { fprintf(stderr, "too many forwards\n"); return 2; }
             char *t = (char *)opt(argc, argv, &i, "--forward"), *h, *p;
-            if (hostport(t, &h, &p) != 0) { fprintf(stderr, "bad --forward %s (want host:port)\n", t); return 2; }
+            /* M7: an optional "tcp:"/"sni:" prefix declares the forward's kind (default tcp), so
+             * the agent's forward sequence is checked against the relay's at registration. */
+            uint8_t kind = TUNNEL_FWD_TCP;
+            if      (!strncmp(t, "tcp:", 4)) { t += 4; kind = TUNNEL_FWD_TCP; }
+            else if (!strncmp(t, "sni:", 4)) { t += 4; kind = TUNNEL_FWD_SNI; }
+            if (hostport(t, &h, &p) != 0) { fprintf(stderr, "bad --forward %s (want [tcp:|sni:]host:port)\n", t); return 2; }
             snprintf(fwd[nfwd].host, sizeof fwd[nfwd].host, "%s", h);
             snprintf(fwd[nfwd].port, sizeof fwd[nfwd].port, "%s", p);
+            hello.forward_kinds[nfwd] = kind; hello.n_forwards = nfwd + 1;
             nfwd++;
         }
         else if (!strcmp(argv[i], "--host")) {

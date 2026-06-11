@@ -112,6 +112,11 @@ if(TUNNEL_BUILD_TESTS)
     target_link_libraries(open_atomic_test PRIVATE tunnel)
     add_test(NAME open_atomic COMMAND open_atomic_test)
 
+    # M7: HELLO/HELLO_OK negotiate the forward-kind sequence; misalignment refused.
+    add_executable(forward_negotiation_test tests/forward_negotiation_test.c)
+    target_link_libraries(forward_negotiation_test PRIVATE tunnel)
+    add_test(NAME forward_negotiation COMMAND forward_negotiation_test)
+
     # M4: a stalled stream is reset past a deadline and stops blocking the shared tunnel.
     add_executable(stream_backpressure_test tests/stream_backpressure_test.c)
     target_link_libraries(stream_backpressure_test PRIVATE tunnel)

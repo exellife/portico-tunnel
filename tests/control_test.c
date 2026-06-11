@@ -28,7 +28,7 @@ static void *accept_thread(void *p) {
     struct accept_ctx *c = p;
     tunnel_io_t io = tunnel_io_fd(c->fd);
     tunnel_decoder_t dec; tunnel_decoder_reset(&dec);
-    c->rc = tunnel_relay_accept(&io, &dec, &c->hello, NULL, allow_one, (void *)c->allowed, NULL, 0);
+    c->rc = tunnel_relay_accept(&io, &dec, &c->hello, NULL, NULL, 0, allow_one, (void *)c->allowed, NULL, 0);
     return NULL;
 }
 

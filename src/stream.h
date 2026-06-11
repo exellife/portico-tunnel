@@ -91,6 +91,8 @@ typedef struct {
     size_t      n_listeners;
     const tunnel_sni_route_t *routes;    /* SNI host -> forward_id */
     size_t      n_routes;
+    const uint8_t *forward_kinds;        /* M7: authoritative forward kind by forward_id (NULL = no negotiation) */
+    size_t      n_forwards;
     int       (*allow)(const char *agent_id, const char *hostname, void *ud);
     void       *allow_ud;
     int         heartbeat_secs;          /* 0 -> 20 */

@@ -71,7 +71,7 @@ static void *stub_thread(void *p) {
         tunnel_io_t io = tunnel_io_tls(&tls);
         tunnel_decoder_t d; tunnel_decoder_reset(&d);
         tunnel_hello_t h; char err[128];
-        tunnel_relay_accept(&io, &d, &h, tls.peer_id, allow_record, NULL, err, sizeof err);
+        tunnel_relay_accept(&io, &d, &h, tls.peer_id, NULL, 0, allow_record, NULL, err, sizeof err);
         tunnel_tls_free(&tls);
     } else { close(c); }
     atomic_store(&s->done, 1);

@@ -66,7 +66,7 @@ static void *relay_drop_thread(void *p) {
             tunnel_io_t io = tunnel_io_tls(&tls);
             tunnel_decoder_t dec; tunnel_decoder_reset(&dec);
             tunnel_hello_t h;
-            if (tunnel_relay_accept(&io, &dec, &h, tls.peer_id, allow_all, NULL, NULL, 0) == 0)
+            if (tunnel_relay_accept(&io, &dec, &h, tls.peer_id, NULL, 0, allow_all, NULL, NULL, 0) == 0)
                 atomic_fetch_add(&r->conns, 1);
             tunnel_tls_free(&tls);                   /* DROP — the agent must reconnect */
         } else {

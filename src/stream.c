@@ -558,7 +558,8 @@ int tunnel_relay_run(const tunnel_relay_run_config_t *cfg) {
         tunnel_io_t io = tunnel_io_tls(&tls);
         tunnel_decoder_t rdec; tunnel_decoder_reset(&rdec);
         tunnel_hello_t h; char err[256];
-        if (tunnel_relay_accept(&io, &rdec, &h, tls.peer_id, cfg->allow, cfg->allow_ud, err, sizeof err) == 0) {
+        if (tunnel_relay_accept(&io, &rdec, &h, tls.peer_id, cfg->forward_kinds, cfg->n_forwards,
+                                cfg->allow, cfg->allow_ud, err, sizeof err) == 0) {
             /* H4: serve only the SNI routes THIS agent's verified identity is authorized for,
              * not the relay's whole table — so one tenant can't receive (and MITM) another
              * tenant's hostnames. With allow_all every route passes (single-tenant default). */

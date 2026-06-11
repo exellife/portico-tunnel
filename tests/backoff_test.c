@@ -73,7 +73,7 @@ static void *stub_thread(void *p) {
         tunnel_io_t io = tunnel_io_tls(&tls);
         tunnel_decoder_t d; tunnel_decoder_reset(&d);
         tunnel_hello_t h; char err[128];
-        if (tunnel_relay_accept(&io, &d, &h, tls.peer_id, allow_all, NULL, err, sizeof err) == 0) {
+        if (tunnel_relay_accept(&io, &d, &h, tls.peer_id, NULL, 0, allow_all, NULL, err, sizeof err) == 0) {
             int i = atomic_load(&s->n);
             if (i < WANT) { s->t[i] = now_ms(); atomic_store(&s->n, i + 1); }
         }
