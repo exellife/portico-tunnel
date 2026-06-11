@@ -51,6 +51,7 @@ struct stream {
 };
 
 #define CONNECT_TIMEOUT_MS 10000
+#define STABLE_SESSION_MS  5000    /* a served session this long counts as useful (resets backoff) */
 
 static long now_ms(void) {
     struct timespec ts;
@@ -579,12 +580,16 @@ int tunnel_agent_run(const tunnel_agent_run_config_t *cfg) {
         struct timeval zero = { 0, 0 };
         setsockopt(tls.fd, SOL_SOCKET, SO_RCVTIMEO, &zero, sizeof zero);
         setsockopt(tls.fd, SOL_SOCKET, SO_SNDTIMEO, &zero, sizeof zero);
-        backoff = bmin;                              /* a real session resets the backoff */
 
         tunnel_conn_t conn; tunnel_conn_ssl(&conn, tls.ssl);
         int idle = cfg->idle_timeout_ms > 0 ? cfg->idle_timeout_ms : 60000;
+        long t0 = now_ms();
         serve_loop(&conn, 0, NULL, 0, cfg->forwards, cfg->n_forwards, NULL, 0, hb, idle, &rdec, cfg->stop);
         tunnel_tls_free(&tls);                        /* tunnel ended — reconnect */
+        /* M10: only a session that actually stayed up resets the backoff. Registering and
+         * then being dropped immediately is NOT progress — a flapping relay must not be
+         * hammered at the floor interval; let the backoff keep growing. */
+        if (now_ms() - t0 >= STABLE_SESSION_MS) backoff = bmin;
 
     retry:
         if (stopped(cfg)) break;

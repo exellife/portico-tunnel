@@ -112,6 +112,11 @@ if(TUNNEL_BUILD_TESTS)
     target_link_libraries(open_atomic_test PRIVATE tunnel)
     add_test(NAME open_atomic COMMAND open_atomic_test)
 
+    # M10: backoff grows across instantly-dropped (useless) sessions instead of pinning.
+    add_executable(backoff_test tests/backoff_test.c)
+    target_link_libraries(backoff_test PRIVATE tunnel)
+    add_test(NAME backoff COMMAND backoff_test)
+
     # M9: serve_loop honors the stop flag mid-session (no wedge on a live idle tunnel).
     add_executable(stop_flag_test tests/stop_flag_test.c)
     target_link_libraries(stop_flag_test PRIVATE tunnel)
