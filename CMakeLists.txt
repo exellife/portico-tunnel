@@ -27,7 +27,8 @@ find_package(Threads REQUIRED)
 
 # --- libtunnel: the shared core (relay + agent both link it) ---
 add_library(tunnel STATIC
-    src/splice.c)
+    src/splice.c
+    src/frame.c)
 target_include_directories(tunnel PUBLIC src)
 target_compile_options(tunnel PRIVATE -Wall -Wextra -Wno-unused-parameter)
 target_link_libraries(tunnel PUBLIC Threads::Threads)
@@ -41,4 +42,9 @@ if(TUNNEL_BUILD_TESTS)
     add_executable(splice_test tests/splice_test.c)
     target_link_libraries(splice_test PRIVATE tunnel)
     add_test(NAME splice COMMAND splice_test)
+
+    # Wire frame codec: roundtrip, big-endian layout, edge cases, streaming reassembly.
+    add_executable(frame_test tests/frame_test.c)
+    target_link_libraries(frame_test PRIVATE tunnel)
+    add_test(NAME frame COMMAND frame_test)
 endif()
