@@ -112,6 +112,11 @@ if(TUNNEL_BUILD_TESTS)
     target_link_libraries(open_atomic_test PRIVATE tunnel)
     add_test(NAME open_atomic COMMAND open_atomic_test)
 
+    # M6: registration decoder handoff — a frame pipelined after HELLO_OK isn't lost.
+    add_executable(register_handoff_test tests/register_handoff_test.c)
+    target_link_libraries(register_handoff_test PRIVATE tunnel)
+    add_test(NAME register_handoff COMMAND register_handoff_test)
+
     # M2: teardown frames (END/RESET) survive tw backpressure — never silently dropped.
     add_executable(teardown_test tests/teardown_test.c)
     target_link_libraries(teardown_test PRIVATE tunnel)
