@@ -75,6 +75,7 @@ static int refuse(tunnel_io_t *io, char *err, size_t errcap, const char *msg) {
 }
 
 int tunnel_relay_accept(tunnel_io_t *io, tunnel_decoder_t *dec, tunnel_hello_t *hello_out,
+                        const char *peer_id,
                         int (*allow)(const char *, const char *, void *),
                         void *ud, char *err, size_t errcap) {
     if (err && errcap) err[0] = '\0';
@@ -90,11 +91,16 @@ int tunnel_relay_accept(tunnel_io_t *io, tunnel_decoder_t *dec, tunnel_hello_t *
 
         tunnel_hello_t h;
         if (tunnel_hello_parse(f.payload, f.len, &h) != 0) return refuse(io, err, errcap, "malformed HELLO");
+        /* H4/M13: authorize on the VERIFIED cert identity (the mTLS subject CN), never the
+         * HELLO agent_id, which the agent chooses freely and can spoof. The agent_id stays a
+         * cosmetic label. peer_id NULL = non-mTLS transport (unit tests over a socketpair) ->
+         * fall back to the HELLO agent_id. */
+        const char *identity = peer_id ? peer_id : h.agent_id;
         /* Zero hostnames is fine — a pure tcp-forward agent declares none (the relay
          * routes by its own config; mTLS is the trust gate). hostnames, when present,
          * are still authorized below. */
         for (size_t i = 0; i < h.n_hosts; i++) {
-            if (allow && !allow(h.agent_id, h.hostnames[i], ud)) {
+            if (allow && !allow(identity, h.hostnames[i], ud)) {
                 char m[300];
                 snprintf(m, sizeof m, "hostname not allowed: %s", h.hostnames[i]);
                 return refuse(io, err, errcap, m);

@@ -82,7 +82,7 @@ static void *srv_thread(void *p) {
         tunnel_io_t io = tunnel_io_tls(&tls);
         tunnel_decoder_t dec; tunnel_decoder_reset(&dec);
         tunnel_hello_t h;
-        if (tunnel_relay_accept(&io, &dec, &h, allow_one, (void *)s->allowed, NULL, 0) == 0)
+        if (tunnel_relay_accept(&io, &dec, &h, tls.peer_id, allow_one, (void *)s->allowed, NULL, 0) == 0)
             s->registered = 1;
         tunnel_tls_free(&tls);
     } else {

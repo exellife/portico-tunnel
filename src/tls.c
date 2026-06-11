@@ -10,6 +10,7 @@
 #include <netdb.h>
 #include <sys/socket.h>
 #include <openssl/err.h>
+#include <openssl/x509.h>
 
 /* ---- tunnel_io_t over SSL ---- */
 
@@ -134,6 +135,17 @@ int tunnel_tls_accept(int fd, const char *server_cert, const char *server_key,
         if (!ssl) break;
         SSL_set_fd(ssl, fd);
         if (SSL_accept(ssl) != 1) { SSL_free(ssl); break; }      /* handshake + client-cert verify */
+        /* H4/M13: capture the VERIFIED peer identity (cert subject CN) for authorization.
+         * The chain is already validated; this is the identity authz must key on — never the
+         * agent-supplied HELLO string. */
+        if (client_ca) {
+            X509 *peer = SSL_get_peer_certificate(ssl);
+            if (!peer) { SSL_free(ssl); break; }                 /* required above, but be defensive */
+            X509_NAME *nm = X509_get_subject_name(peer);
+            if (X509_NAME_get_text_by_NID(nm, NID_commonName, out->peer_id, (int)sizeof out->peer_id) <= 0)
+                out->peer_id[0] = '\0';
+            X509_free(peer);
+        }
         out->ssl = ssl; out->ctx = ctx; out->fd = fd; ok = 1;
     } while (0);
 

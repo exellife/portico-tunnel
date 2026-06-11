@@ -29,9 +29,16 @@ int tunnel_agent_register(tunnel_io_t *io, tunnel_decoder_t *dec,
 
 /* Relay side: read the agent's HELLO, authorize EVERY hostname via allow() (returns
  * nonzero to permit), then reply HELLO_OK or HELLO_ERR. Returns 0 on acceptance (with
- * `hello_out` filled), -1 on refusal / error. Answers PINGs while waiting. */
+ * `hello_out` filled), -1 on refusal / error. Answers PINGs while waiting.
+ *
+ * `peer_id` is the VERIFIED identity (the mTLS client-cert subject CN, from
+ * tunnel_tls_t.peer_id). When non-NULL it is the identity passed to allow() — never the
+ * agent-supplied HELLO agent_id, which is spoofable — and a HELLO whose agent_id is set
+ * but does not match `peer_id` is refused. Pass NULL only on a non-mTLS transport (e.g.
+ * unit tests over a socketpair), where allow() falls back to the HELLO agent_id. (H4/M13) */
 int tunnel_relay_accept(tunnel_io_t *io, tunnel_decoder_t *dec, tunnel_hello_t *hello_out,
-                        int (*allow)(const char *agent_id, const char *hostname, void *ud),
+                        const char *peer_id,
+                        int (*allow)(const char *identity, const char *hostname, void *ud),
                         void *ud, char *err, size_t errcap);
 
 #endif /* PORTICO_TUNNEL_CONTROL_H */

@@ -112,6 +112,11 @@ if(TUNNEL_BUILD_TESTS)
     target_link_libraries(open_atomic_test PRIVATE tunnel)
     add_test(NAME open_atomic COMMAND open_atomic_test)
 
+    # H4/M13: relay authorizes on the verified cert CN, not the spoofable HELLO agent_id.
+    add_executable(cert_identity_test tests/cert_identity_test.c)
+    target_link_libraries(cert_identity_test PRIVATE tunnel)
+    add_test(NAME cert_identity COMMAND cert_identity_test)
+
     # M10: backoff grows across instantly-dropped (useless) sessions instead of pinning.
     add_executable(backoff_test tests/backoff_test.c)
     target_link_libraries(backoff_test PRIVATE tunnel)

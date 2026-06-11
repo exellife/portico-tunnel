@@ -68,7 +68,7 @@ static void *stub_thread(void *p) {
     tunnel_io_t io = tunnel_io_tls(&tls);
     tunnel_decoder_t d; tunnel_decoder_reset(&d);
     tunnel_hello_t h; char err[128];
-    if (tunnel_relay_accept(&io, &d, &h, allow_all, NULL, err, sizeof err) == 0) {
+    if (tunnel_relay_accept(&io, &d, &h, tls.peer_id, allow_all, NULL, err, sizeof err) == 0) {
         atomic_store(&s->registered, 1);
         unsigned char b[256];
         while (SSL_read(tls.ssl, b, sizeof b) > 0) { }   /* idle: hold until the agent drops on stop */

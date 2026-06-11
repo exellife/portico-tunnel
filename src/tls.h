@@ -14,6 +14,7 @@ typedef struct {
     SSL     *ssl;
     SSL_CTX *ctx;
     int      fd;
+    char     peer_id[256];   /* relay side: verified peer-cert subject CN (the authz identity) */
 } tunnel_tls_t;
 
 /* tunnel_io_t over an established connection (SSL_read/SSL_write). */

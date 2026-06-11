@@ -547,7 +547,7 @@ int tunnel_relay_run(const tunnel_relay_run_config_t *cfg) {
         tunnel_io_t io = tunnel_io_tls(&tls);
         tunnel_decoder_t rdec; tunnel_decoder_reset(&rdec);
         tunnel_hello_t h; char err[256];
-        if (tunnel_relay_accept(&io, &rdec, &h, cfg->allow, cfg->allow_ud, err, sizeof err) == 0) {
+        if (tunnel_relay_accept(&io, &rdec, &h, tls.peer_id, cfg->allow, cfg->allow_ud, err, sizeof err) == 0) {
             tunnel_conn_t conn; tunnel_conn_ssl(&conn, tls.ssl);
             int idle = cfg->idle_timeout_ms > 0 ? cfg->idle_timeout_ms : 30000;
             serve_loop(&conn, 1, cfg->listeners, cfg->n_listeners, NULL, 0, cfg->routes, cfg->n_routes, hb, idle, &rdec, cfg->stop);
