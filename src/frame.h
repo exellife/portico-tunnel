@@ -18,6 +18,7 @@
 
 #define TUNNEL_FRAME_HDR  9u       /* fixed header size */
 #define TUNNEL_MAX_FRAME  16384u   /* max payload bytes per frame (DATA is chunked to this) */
+#define TUNNEL_RECV_CHUNK 4096u    /* framed-read recv granularity (see decoder sizing) */
 
 enum tunnel_frame_type {
     TF_HELLO     = 0x01,   /* A->R: agent_id, auth, hostnames */
@@ -53,7 +54,9 @@ long tunnel_frame_parse(const uint8_t *in, size_t n, tunnel_frame_t *out);
  * Push received bytes, pull complete frames. A returned frame's payload points
  * into the decoder and is valid until the next push/next call. */
 typedef struct {
-    uint8_t buf[TUNNEL_FRAME_HDR + TUNNEL_MAX_FRAME];
+    /* Sized to hold one max frame PLUS a recv chunk, so a framed read can always push
+     * a whole recv() result on top of a partial frame without splitting it. */
+    uint8_t buf[TUNNEL_FRAME_HDR + TUNNEL_MAX_FRAME + TUNNEL_RECV_CHUNK];
     size_t  have;
     size_t  pending;   /* bytes of an already-returned frame, dropped on next op */
 } tunnel_decoder_t;

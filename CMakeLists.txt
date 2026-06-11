@@ -28,7 +28,9 @@ find_package(Threads REQUIRED)
 # --- libtunnel: the shared core (relay + agent both link it) ---
 add_library(tunnel STATIC
     src/splice.c
-    src/frame.c)
+    src/frame.c
+    src/io.c
+    src/control.c)
 target_include_directories(tunnel PUBLIC src)
 target_compile_options(tunnel PRIVATE -Wall -Wextra -Wno-unused-parameter)
 target_link_libraries(tunnel PUBLIC Threads::Threads)
@@ -47,4 +49,9 @@ if(TUNNEL_BUILD_TESTS)
     add_executable(frame_test tests/frame_test.c)
     target_link_libraries(frame_test PRIVATE tunnel)
     add_test(NAME frame COMMAND frame_test)
+
+    # Control channel: HELLO codec + register/accept handshake over a socketpair.
+    add_executable(control_test tests/control_test.c)
+    target_link_libraries(control_test PRIVATE tunnel)
+    add_test(NAME control COMMAND control_test)
 endif()
