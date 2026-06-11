@@ -107,6 +107,11 @@ if(TUNNEL_BUILD_TESTS)
     target_link_libraries(connect_test PRIVATE tunnel)
     add_test(NAME connect COMMAND connect_test)
 
+    # M1: open_public commits OPEN + buffered ClientHello atomically under tw backpressure.
+    add_executable(open_atomic_test tests/open_atomic_test.c)
+    target_link_libraries(open_atomic_test PRIVATE tunnel)
+    add_test(NAME open_atomic COMMAND open_atomic_test)
+
     # W2: idle reaping — slowloris peekers reaped, tcp decoupled, healthy-idle preserved.
     add_executable(idle_reaping_test tests/idle_reaping_test.c)
     target_link_libraries(idle_reaping_test PRIVATE tunnel)

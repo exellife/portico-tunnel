@@ -140,24 +140,34 @@ static int sni_lookup(const tunnel_sni_route_t *routes, size_t n, const char *ho
     return 0;
 }
 
-/* Open a stream for an accepted public fd, sending OPEN{forward_id, client_ip}. The
- * caller has reserved tw room. Returns the stream, or NULL (slot/room exhausted; fd
- * closed). If `prefix`/`plen` is given (SNI peeker buffer), it is fed as initial DATA. */
+/* Open a stream for an accepted public fd, sending OPEN{forward_id, client_ip} followed
+ * by the buffered SNI ClientHello (`prefix`/`plen`) as initial DATA. ATOMIC (M1): either
+ * the whole OPEN+prefix is committed to tw, or nothing is — a half-sent ClientHello would
+ * wedge the origin's TLS handshake forever. Returns the stream on success. On failure
+ * returns NULL: if `*again` is set the tw buffer simply lacks room right now and NOTHING
+ * was touched (fd still open — the caller should retry once tw drains); otherwise the
+ * stream slot was exhausted and the fd has been closed. */
 static struct stream *open_public(struct stream *st, uint32_t *next_sid, int fd, uint32_t fid,
                                   const unsigned char *prefix, size_t plen,
-                                  unsigned char *tw, size_t *twlen) {
-    struct stream *s = alloc_stream(st, *next_sid);
-    if (!s) { close(fd); return NULL; }
-    s->fd = fd;
+                                  unsigned char *tw, size_t *twlen, int *again) {
+    if (again) *again = 0;
     char ip[64]; peer_ip(fd, ip, sizeof ip);
-    unsigned char pl[OPEN_HDR]; put_be32(pl, fid);
     size_t il = strlen(ip); if (il > OPEN_HDR - 4) il = OPEN_HDR - 4;
-    memcpy(pl + 4, ip, il);
-    if (tw_frame(tw, twlen, TF_OPEN, s->sid, pl, (uint32_t)(4 + il)) < 0) { close_stream(s); return NULL; }
+
+    /* exact bytes this open will append to tw — checked up front so no frame is dropped */
+    size_t need = TUNNEL_FRAME_HDR + 4 + il;
+    if (plen) { size_t nf = (plen + TUNNEL_MAX_FRAME - 1) / TUNNEL_MAX_FRAME; need += plen + nf * TUNNEL_FRAME_HDR; }
+    if (*twlen + need > TW_CAP) { if (again) { *again = 1; return NULL; } close(fd); return NULL; }
+
+    struct stream *s = alloc_stream(st, *next_sid);
+    if (!s) { close(fd); return NULL; }                       /* slot exhausted */
+    s->fd = fd;
+    unsigned char pl[OPEN_HDR]; put_be32(pl, fid); memcpy(pl + 4, ip, il);
+    tw_frame(tw, twlen, TF_OPEN, s->sid, pl, (uint32_t)(4 + il));   /* room pre-checked: cannot fail */
     (*next_sid)++;
     for (size_t off = 0; off < plen; ) {
         size_t c = plen - off; if (c > TUNNEL_MAX_FRAME) c = TUNNEL_MAX_FRAME;
-        if (tw_frame(tw, twlen, TF_DATA, s->sid, prefix + off, (uint32_t)c) < 0) break;
+        tw_frame(tw, twlen, TF_DATA, s->sid, prefix + off, (uint32_t)c);
         off += c;
     }
     return s;
@@ -321,7 +331,7 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
                         for (int j = 0; j < MAX_PEEKERS; j++)
                             if (!pk[j].active) { pk[j].active = 1; pk[j].fd = c; pk[j].len = 0; pk[j].since = now_ms(); placed = 1; break; }
                         if (!placed) { close(c); break; }
-                    } else if (!open_public(st, &next_sid, c, L->forward_id, NULL, 0, tw, &twlen)) {
+                    } else if (!open_public(st, &next_sid, c, L->forward_id, NULL, 0, tw, &twlen, NULL)) {
                         break;
                     }
                     if (twlen + TUNNEL_FRAME_HDR + OPEN_HDR > TW_CAP) break;
@@ -363,22 +373,31 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
             }
         }
 
-        /* --- relay: feed SNI peekers, resolve to streams --- */
+        /* --- relay: feed SNI peekers (read newly-arrived ClientHello bytes) --- */
         for (int k = str_end; k < pk_end; k++) {
             struct peeker *q = pmap[k];
             if (!q->active || !(p[k].revents & (POLLIN | POLLHUP))) continue;
             ssize_t n = read(q->fd, q->buf + q->len, PEEK_CAP - q->len);
             if (n <= 0) { if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) { close(q->fd); q->active = 0; } continue; }
             q->len += (size_t)n; q->since = now_ms();
+        }
+        /* Resolve+open any buffered peeker. Decoupled from POLLIN so a peeker that could
+         * not be opened last iteration for lack of tw room (open_public *again*) is retried
+         * once the tunnel drains — not stranded waiting for bytes that will never come. */
+        for (int i = 0; i < MAX_PEEKERS; i++) {
+            struct peeker *q = &pk[i];
+            if (!q->active || q->len == 0) continue;
             char host[256];
             int r = tunnel_sni_peek(q->buf, q->len, host, sizeof host);
-            if (r == 0) { if (q->len >= PEEK_CAP) { close(q->fd); q->active = 0; } continue; }
+            if (r == 0) { if (q->len >= PEEK_CAP) { close(q->fd); q->active = 0; } continue; }  /* need more bytes */
             if (r < 0) { close(q->fd); q->active = 0; continue; }
             uint32_t fid;
             if (!sni_lookup(routes, nroutes, host, &fid)) { close(q->fd); q->active = 0; continue; }
-            int fd = q->fd;
-            q->active = 0; q->fd = -1;                       /* fd ownership moves to the stream */
-            open_public(st, &next_sid, fd, fid, q->buf, q->len, tw, &twlen);
+            int again = 0;
+            struct stream *s = open_public(st, &next_sid, q->fd, fid, q->buf, q->len, tw, &twlen, &again);
+            if (s) { q->active = 0; q->fd = -1; }            /* fd ownership moved to the stream */
+            else if (!again) q->active = 0;                  /* slot exhausted: open_public closed the fd */
+            /* else: no tw room yet — keep the peeker and retry next iteration */
         }
 
         /* --- reap: finished streams, stuck connects, idle peekers, and stuck streams
