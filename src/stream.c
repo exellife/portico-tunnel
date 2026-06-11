@@ -277,15 +277,21 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
         int timeout = (ssl_more || seeded) ? 0 : base;
         int pr = poll(p, (nfds_t)np, timeout);
         if (pr < 0) { if (errno == EINTR) continue; rc = -1; break; }
-        if (pr == 0 && heartbeat_secs > 0 && !ssl_more) {       /* idle interval elapsed */
-            if (++missed > 2) { rc = -1; break; }               /* no traffic for ~2 intervals -> dead */
-            if (tw_frame(tw, &twlen, TF_PING, 0, NULL, 0) < 0) { rc = -1; break; }
+        /* Heartbeat only when genuinely idle: nothing is queued for the peer (twoff==twlen)
+         * and we're not blocked on a local sink (!backpressured). Under backpressure the
+         * tunnel is busy, not dead — counting a "missed" PONG (we aren't reading the tunnel)
+         * or tearing down because a PING can't be queued into a full tw would kill a live
+         * tunnel (M8). When idle, tw is empty so the PING always fits. */
+        if (pr == 0 && heartbeat_secs > 0 && !ssl_more && !backpressured && twoff == twlen) {
+            if (++missed > 2) { rc = -1; break; }               /* idle + silent for ~2 intervals -> dead */
+            tw_frame(tw, &twlen, TF_PING, 0, NULL, 0);
         }
 
         /* --- tunnel out: always try to flush pending bytes (non-blocking) --- */
         if (twoff < twlen) {
             long w = tunnel_conn_write(conn, tw + twoff, twlen - twoff);
-            if (w > 0) { twoff += (size_t)w; if (twoff == twlen) twoff = twlen = 0; }
+            if (w > 0) { twoff += (size_t)w; missed = 0;        /* peer is accepting our bytes -> alive */
+                         if (twoff == twlen) twoff = twlen = 0; }
             else if (w == -1) { rc = -1; break; }
         }
         /* --- tunnel in --- */
