@@ -46,6 +46,8 @@ struct stream {
     long     connect_deadline; /* monotonic ms by which the connect must complete */
     long     last_activity;    /* monotonic ms of the last byte moved (or creation) */
     int      activated;        /* has any byte ever flowed on this stream? */
+    int      pending_end;      /* owe the peer a TF_END but tw was full — retry until sent */
+    int      pending_reset;    /* tombstone: fd closed, owe the peer a TF_RESET — retry, then free */
 };
 
 #define CONNECT_TIMEOUT_MS 10000
@@ -133,6 +135,31 @@ static int tw_frame(unsigned char *tw, size_t *twlen, uint8_t type, uint32_t sid
 static void close_stream(struct stream *s) {
     if (s->fd >= 0) close(s->fd);
     s->active = 0;
+}
+/* Teardown frames must reach the peer or its matching stream leaks (half-open forever).
+ * tw may be full at the moment we need to tear down, so these never fire-and-forget:
+ *  - END half-closes our write side; if it can't be queued now, remember it (pending_end).
+ *  - RESET aborts the stream; close the local fd immediately but keep the slot as a
+ *    tombstone (pending_reset) until the RESET is actually flushed, then free it.
+ * A small retry pass each iteration drains the pending frames as soon as tw has room. */
+static void send_end(struct stream *s, unsigned char *tw, size_t *twlen) {
+    if (s->local_eof) return;
+    s->local_eof = 1;
+    if (tw_frame(tw, twlen, TF_END, s->sid, NULL, 0) < 0) s->pending_end = 1;
+}
+static void send_reset(struct stream *s, unsigned char *tw, size_t *twlen) {
+    if (s->fd >= 0) { close(s->fd); s->fd = -1; }
+    s->connecting = 0; s->pending_end = 0; s->tooff = s->tolen = 0;   /* tombstone, no more I/O */
+    if (tw_frame(tw, twlen, TF_RESET, s->sid, NULL, 0) == 0) s->active = 0;   /* delivered -> free */
+    else s->pending_reset = 1;                                               /* retry until flushed */
+}
+static void flush_pending_teardown(struct stream *st, unsigned char *tw, size_t *twlen) {
+    for (int i = 0; i < MAX_STREAMS; i++) {
+        struct stream *s = &st[i];
+        if (!s->active) continue;
+        if (s->pending_reset) { if (tw_frame(tw, twlen, TF_RESET, s->sid, NULL, 0) == 0) s->active = 0; }
+        else if (s->pending_end) { if (tw_frame(tw, twlen, TF_END, s->sid, NULL, 0) == 0) s->pending_end = 0; }
+    }
 }
 static int sni_lookup(const tunnel_sni_route_t *routes, size_t n, const char *host, uint32_t *fid) {
     for (size_t i = 0; i < n; i++)
@@ -289,10 +316,11 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
                 if (is_relay) continue;
                 uint32_t fid = (f.len >= 4) ? be32(f.payload) : 0xffffffffu;
                 struct stream *s = alloc_stream(st, f.stream_id);
-                if (!s || fid >= nfwd) { tw_frame(tw, &twlen, TF_RESET, f.stream_id, NULL, 0); if (s) s->active = 0; continue; }
+                if (!s) { tw_frame(tw, &twlen, TF_RESET, f.stream_id, NULL, 0); continue; }  /* no slot: best effort */
+                if (fid >= nfwd) { send_reset(s, tw, &twlen); continue; }                    /* unknown forward */
                 int connecting = 0;
                 int lfd = dial_local(&fwd[fid], &connecting);       /* non-blocking */
-                if (lfd < 0) { tw_frame(tw, &twlen, TF_RESET, f.stream_id, NULL, 0); s->active = 0; continue; }
+                if (lfd < 0) { send_reset(s, tw, &twlen); continue; }
                 s->fd = lfd;
                 s->connecting = connecting;
                 if (connecting) s->connect_deadline = now_ms() + CONNECT_TIMEOUT_MS;
@@ -300,22 +328,25 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
             }
             struct stream *s = find_stream(st, f.stream_id);
             if (f.type == TF_DATA) {
-                if (!s) continue;
+                if (!s || s->fd < 0) continue;                      /* unknown or tombstoned */
                 s->last_activity = now_ms(); s->activated = 1;
                 memcpy(s->tobuf, f.payload, f.len);
                 s->tolen = f.len; s->tooff = 0;
                 ssize_t w = (f.len ? send(s->fd, s->tobuf, s->tolen, MSG_NOSIGNAL) : 0);
                 if (w > 0) { s->tooff += (size_t)w; if (s->tooff == s->tolen) s->tooff = s->tolen = 0; }
                 else if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-                    tw_frame(tw, &twlen, TF_RESET, s->sid, NULL, 0); close_stream(s);
+                    send_reset(s, tw, &twlen);
                 }
             } else if (f.type == TF_END) {
-                if (s) { s->remote_eof = 1;
+                if (s && s->fd >= 0) { s->remote_eof = 1;
                     if (s->tooff == s->tolen && !s->wr_shut) { shutdown(s->fd, SHUT_WR); s->wr_shut = 1; } }
             } else if (f.type == TF_RESET) {
-                if (s) close_stream(s);
+                if (s) { s->pending_end = s->pending_reset = 0; close_stream(s); }
             }
         }
+
+        /* retry any teardown frame that couldn't be queued earlier (tw was full) */
+        flush_pending_teardown(st, tw, &twlen);
 
         /* --- relay: accept new public connections (per-listener gated in the poll-set) --- */
         {
@@ -348,7 +379,7 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
                     int err = 0; socklen_t el = sizeof err;
                     getsockopt(s->fd, SOL_SOCKET, SO_ERROR, &err, &el);
                     if (err == 0) s->connecting = 0;      /* connected — normal I/O resumes next loop */
-                    else { tw_frame(tw, &twlen, TF_RESET, s->sid, NULL, 0); close_stream(s); }
+                    else send_reset(s, tw, &twlen);
                 }
                 continue;                                 /* no data I/O while still connecting */
             }
@@ -358,18 +389,16 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
                         s->tooff = s->tolen = 0;
                         if (s->remote_eof && !s->wr_shut) { shutdown(s->fd, SHUT_WR); s->wr_shut = 1; } } }
                 else if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-                    tw_frame(tw, &twlen, TF_RESET, s->sid, NULL, 0); close_stream(s); continue;
+                    send_reset(s, tw, &twlen); continue;
                 }
             }
-            if (s->active && (p[k].revents & (POLLIN | POLLHUP))) {
+            if (s->active && s->fd >= 0 && (p[k].revents & (POLLIN | POLLHUP))) {
                 unsigned char tmp[TUNNEL_MAX_FRAME];
                 ssize_t n = read(s->fd, tmp, sizeof tmp);
                 if (n > 0) { s->last_activity = now_ms(); s->activated = 1;
                     if (tw_frame(tw, &twlen, TF_DATA, s->sid, tmp, (uint32_t)n) < 0) { rc = -1; goto done; } }
-                else if (n == 0) { tw_frame(tw, &twlen, TF_END, s->sid, NULL, 0); s->local_eof = 1; }
-                else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-                    tw_frame(tw, &twlen, TF_RESET, s->sid, NULL, 0); close_stream(s);
-                }
+                else if (n == 0) send_end(s, tw, &twlen);
+                else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) send_reset(s, tw, &twlen);
             }
         }
 
@@ -405,17 +434,15 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
          *     activity and is merely quiet is NEVER reaped (legit idle, e.g. SSH). --- */
         long now = (any_connecting || idle_timeout_ms > 0) ? now_ms() : 0;
         for (int i = 0; i < MAX_STREAMS; i++) {
-            if (!st[i].active) continue;
+            if (!st[i].active || st[i].pending_reset) continue;       /* tombstones drain via flush */
             if (st[i].connecting) {                                   /* local target never came up */
-                if (now >= st[i].connect_deadline) { tw_frame(tw, &twlen, TF_RESET, st[i].sid, NULL, 0); close_stream(&st[i]); }
+                if (now >= st[i].connect_deadline) send_reset(&st[i], tw, &twlen);
                 continue;
             }
             if (st[i].local_eof && st[i].remote_eof && st[i].tooff == st[i].tolen) { close_stream(&st[i]); continue; }
             if (idle_timeout_ms > 0 && now - st[i].last_activity > idle_timeout_ms) {
                 int half_closed = (st[i].remote_eof != st[i].local_eof);
-                if (half_closed || !st[i].activated) {                /* stuck, not legit-idle */
-                    tw_frame(tw, &twlen, TF_RESET, st[i].sid, NULL, 0); close_stream(&st[i]);
-                }
+                if (half_closed || !st[i].activated) send_reset(&st[i], tw, &twlen);   /* stuck, not legit-idle */
             }
         }
         if (idle_timeout_ms > 0)

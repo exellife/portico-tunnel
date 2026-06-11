@@ -112,6 +112,11 @@ if(TUNNEL_BUILD_TESTS)
     target_link_libraries(open_atomic_test PRIVATE tunnel)
     add_test(NAME open_atomic COMMAND open_atomic_test)
 
+    # M2: teardown frames (END/RESET) survive tw backpressure — never silently dropped.
+    add_executable(teardown_test tests/teardown_test.c)
+    target_link_libraries(teardown_test PRIVATE tunnel)
+    add_test(NAME teardown COMMAND teardown_test)
+
     # W2: idle reaping — slowloris peekers reaped, tcp decoupled, healthy-idle preserved.
     add_executable(idle_reaping_test tests/idle_reaping_test.c)
     target_link_libraries(idle_reaping_test PRIVATE tunnel)
