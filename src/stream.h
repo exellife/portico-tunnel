@@ -12,7 +12,9 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <openssl/ssl.h>
+#include "control.h"   /* tunnel_hello_t (the forwards the run loop registers) */
 
 /* Where forward_id N points: the local TCP service the agent dials for that forward. */
 typedef struct {
@@ -56,5 +58,24 @@ int tunnel_relay_serve(int tunnel_fd,
 int tunnel_relay_serve_ssl(SSL *tunnel,
                            const tunnel_listener_t *listeners, size_t n_listeners,
                            const tunnel_sni_route_t *routes, size_t n_routes);
+
+/* ---- the self-healing agent run loop ---------------------------------------
+ * connect (TLS dial + verify relay + mTLS) -> register (HELLO) -> serve (with
+ * heartbeats) -> on any drop, exponential backoff + jitter, redial, re-register.
+ * A dynamic-IP change is just a reconnect. Runs until *stop is set. */
+typedef struct {
+    const char *relay_host, *relay_port;
+    const char *ca_file;                 /* verify the relay; NULL = system roots */
+    const char *client_cert, *client_key;/* mTLS identity */
+    const tunnel_hello_t  *hello;        /* what to register */
+    const tunnel_target_t *forwards;     /* forward_id -> local target */
+    size_t      n_forwards;
+    int         heartbeat_secs;          /* 0 -> 20 */
+    int         backoff_min_ms;          /* 0 -> 500 */
+    int         backoff_max_ms;          /* 0 -> 30000 */
+    atomic_int *stop;                    /* optional: set nonzero to stop the loop */
+} tunnel_agent_run_config_t;
+
+int tunnel_agent_run(const tunnel_agent_run_config_t *cfg);
 
 #endif /* PORTICO_TUNNEL_STREAM_H */

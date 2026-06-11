@@ -82,6 +82,11 @@ if(TUNNEL_BUILD_TESTS)
     target_link_libraries(relay_tls_test PRIVATE tunnel)
     add_test(NAME relay_tls COMMAND relay_tls_test)
 
+    # Agent reconnect: relay drops each session; the run loop must keep redialing.
+    add_executable(reconnect_test tests/reconnect_test.c)
+    target_link_libraries(reconnect_test PRIVATE tunnel)
+    add_test(NAME reconnect COMMAND reconnect_test)
+
     # TLS SNI peek: parse real OpenSSL ClientHellos + hostile inputs.
     add_executable(sni_test tests/sni_test.c)
     target_link_libraries(sni_test PRIVATE tunnel)

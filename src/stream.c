@@ -9,6 +9,10 @@
 #include "frame.h"
 #include "sni.h"
 #include "conn.h"
+#include "tls.h"
+#include "control.h"
+
+#include <time.h>
 
 #include <stdio.h>
 #include <string.h>
@@ -137,7 +141,8 @@ static struct stream *open_public(struct stream *st, uint32_t *next_sid, int fd,
 static int serve_loop(tunnel_conn_t *conn, int is_relay,
                       const tunnel_listener_t *lis, size_t nlis,
                       const tunnel_target_t *fwd, size_t nfwd,
-                      const tunnel_sni_route_t *routes, size_t nroutes) {
+                      const tunnel_sni_route_t *routes, size_t nroutes,
+                      int heartbeat_secs) {
     if (is_relay) for (size_t i = 0; i < nlis; i++) set_nonblock(lis[i].listen_fd);
 
     tunnel_decoder_t dec; tunnel_decoder_reset(&dec);
@@ -145,7 +150,7 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
     struct peeker pk[MAX_PEEKERS]; memset(pk, 0, sizeof pk);
     unsigned char tw[TW_CAP]; size_t twlen = 0, twoff = 0;
     uint32_t next_sid = 1;
-    int rc = 0;
+    int rc = 0, missed = 0;
 
     for (;;) {
         int backpressured = 0, has_free = 0, has_peeker = 0;
@@ -184,29 +189,35 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
                 p[np].fd = pk[i].fd; p[np].events = POLLIN; p[np].revents = 0; pmap[np] = &pk[i]; np++;
             }
         int pk_end = np;
-        if (p[0].events == 0 && np == lis_end && lis_end == lis_start) break;
+        if (p[0].events == 0 && np == lis_end && lis_end == lis_start && heartbeat_secs <= 0) break;
 
-        if (poll(p, (nfds_t)np, ssl_more ? 0 : -1) < 0) { if (errno == EINTR) continue; rc = -1; break; }
+        int timeout = ssl_more ? 0 : (heartbeat_secs > 0 ? heartbeat_secs * 1000 : -1);
+        int pr = poll(p, (nfds_t)np, timeout);
+        if (pr < 0) { if (errno == EINTR) continue; rc = -1; break; }
+        if (pr == 0 && heartbeat_secs > 0 && !ssl_more) {       /* idle interval elapsed */
+            if (++missed > 2) { rc = -1; break; }               /* no traffic for ~2 intervals -> dead */
+            if (tw_frame(tw, &twlen, TF_PING, 0, NULL, 0) < 0) { rc = -1; break; }
+        }
 
-        /* --- tunnel (plain fd or SSL) out / in via the non-blocking transport --- */
-        if (ssl_more || (p[0].revents & (POLLIN | POLLOUT | POLLHUP | POLLERR))) {
-            if (twoff < twlen) {
-                long w = tunnel_conn_write(conn, tw + twoff, twlen - twoff);
-                if (w > 0) { twoff += (size_t)w; if (twoff == twlen) twoff = twlen = 0; }
-                else if (w == -1) { rc = -1; break; }
-            }
-            if (!backpressured) {
-                unsigned char tmp[TUNNEL_RECV_CHUNK];
-                long n = tunnel_conn_read(conn, tmp, sizeof tmp);
-                if (n == 0) { rc = 0; break; }
-                else if (n == -1) { rc = -1; break; }
-                else if (n > 0) {
-                    size_t pushed = 0;
-                    while (pushed < (size_t)n) {
-                        size_t c = tunnel_decoder_push(&dec, tmp + pushed, (size_t)n - pushed);
-                        if (c == 0) { rc = -1; goto done; }
-                        pushed += c;
-                    }
+        /* --- tunnel out: always try to flush pending bytes (non-blocking) --- */
+        if (twoff < twlen) {
+            long w = tunnel_conn_write(conn, tw + twoff, twlen - twoff);
+            if (w > 0) { twoff += (size_t)w; if (twoff == twlen) twoff = twlen = 0; }
+            else if (w == -1) { rc = -1; break; }
+        }
+        /* --- tunnel in --- */
+        if (!backpressured && (ssl_more || (p[0].revents & (POLLIN | POLLOUT | POLLHUP | POLLERR)))) {
+            unsigned char tmp[TUNNEL_RECV_CHUNK];
+            long n = tunnel_conn_read(conn, tmp, sizeof tmp);
+            if (n == 0) { rc = 0; break; }
+            else if (n == -1) { rc = -1; break; }
+            else if (n > 0) {
+                missed = 0;                                     /* any traffic = peer is alive */
+                size_t pushed = 0;
+                while (pushed < (size_t)n) {
+                    size_t c = tunnel_decoder_push(&dec, tmp + pushed, (size_t)n - pushed);
+                    if (c == 0) { rc = -1; goto done; }
+                    pushed += c;
                 }
             }
         }
@@ -329,11 +340,11 @@ done:
 
 int tunnel_agent_serve(int tunnel_fd, const tunnel_target_t *forwards, size_t n_forwards) {
     tunnel_conn_t conn; tunnel_conn_fd(&conn, tunnel_fd);
-    return serve_loop(&conn, 0, NULL, 0, forwards, n_forwards, NULL, 0);
+    return serve_loop(&conn, 0, NULL, 0, forwards, n_forwards, NULL, 0, 0);
 }
 int tunnel_agent_serve_ssl(SSL *tunnel, const tunnel_target_t *forwards, size_t n_forwards) {
     tunnel_conn_t conn; tunnel_conn_ssl(&conn, tunnel);
-    return serve_loop(&conn, 0, NULL, 0, forwards, n_forwards, NULL, 0);
+    return serve_loop(&conn, 0, NULL, 0, forwards, n_forwards, NULL, 0, 0);
 }
 
 int tunnel_relay_serve(int tunnel_fd,
@@ -341,12 +352,64 @@ int tunnel_relay_serve(int tunnel_fd,
                        const tunnel_sni_route_t *routes, size_t n_routes) {
     if (n_listeners > MAX_LISTENERS) n_listeners = MAX_LISTENERS;
     tunnel_conn_t conn; tunnel_conn_fd(&conn, tunnel_fd);
-    return serve_loop(&conn, 1, listeners, n_listeners, NULL, 0, routes, n_routes);
+    return serve_loop(&conn, 1, listeners, n_listeners, NULL, 0, routes, n_routes, 0);
 }
 int tunnel_relay_serve_ssl(SSL *tunnel,
                            const tunnel_listener_t *listeners, size_t n_listeners,
                            const tunnel_sni_route_t *routes, size_t n_routes) {
     if (n_listeners > MAX_LISTENERS) n_listeners = MAX_LISTENERS;
     tunnel_conn_t conn; tunnel_conn_ssl(&conn, tunnel);
-    return serve_loop(&conn, 1, listeners, n_listeners, NULL, 0, routes, n_routes);
+    return serve_loop(&conn, 1, listeners, n_listeners, NULL, 0, routes, n_routes, 0);
+}
+
+/* ---- the agent run loop: connect -> register -> serve -> reconnect ---------- */
+
+static int stopped(const tunnel_agent_run_config_t *cfg) {
+    return cfg->stop && atomic_load(cfg->stop);
+}
+
+/* Sleep `ms`, in small slices so the stop flag is observed promptly. */
+static void backoff_sleep(int ms, const tunnel_agent_run_config_t *cfg) {
+    while (ms > 0 && !stopped(cfg)) {
+        int slice = ms > 100 ? 100 : ms;
+        struct timespec ts = { slice / 1000, (long)(slice % 1000) * 1000000L };
+        nanosleep(&ts, NULL);
+        ms -= slice;
+    }
+}
+
+int tunnel_agent_run(const tunnel_agent_run_config_t *cfg) {
+    int hb   = cfg->heartbeat_secs  > 0 ? cfg->heartbeat_secs  : 20;
+    int bmin = cfg->backoff_min_ms  > 0 ? cfg->backoff_min_ms  : 500;
+    int bmax = cfg->backoff_max_ms  > 0 ? cfg->backoff_max_ms  : 30000;
+    unsigned rng = (unsigned)time(NULL) ^ (unsigned)(uintptr_t)cfg;
+    int backoff = bmin;
+
+    while (!stopped(cfg)) {
+        tunnel_tls_t tls;
+        if (tunnel_tls_dial(cfg->relay_host, cfg->relay_port, cfg->ca_file,
+                            cfg->client_cert, cfg->client_key, &tls) != 0)
+            goto retry;
+
+        tunnel_io_t io = tunnel_io_tls(&tls);
+        tunnel_decoder_t rdec; tunnel_decoder_reset(&rdec);
+        char err[256];
+        if (tunnel_agent_register(&io, &rdec, cfg->hello, err, sizeof err) != 0) {
+            tunnel_tls_free(&tls);
+            goto retry;
+        }
+        backoff = bmin;                              /* a real session resets the backoff */
+
+        tunnel_conn_t conn; tunnel_conn_ssl(&conn, tls.ssl);
+        serve_loop(&conn, 0, NULL, 0, cfg->forwards, cfg->n_forwards, NULL, 0, hb);
+        tunnel_tls_free(&tls);                        /* tunnel ended — reconnect */
+
+    retry:
+        if (stopped(cfg)) break;
+        rng = rng * 1103515245u + 12345u;            /* LCG; jitter need not be strong */
+        int jitter = (backoff / 4 > 0) ? (int)(rng % (unsigned)(backoff / 4)) : 0;
+        backoff_sleep(backoff + jitter, cfg);
+        backoff = backoff * 2 > bmax ? bmax : backoff * 2;
+    }
+    return 0;
 }
