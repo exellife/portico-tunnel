@@ -112,6 +112,11 @@ if(TUNNEL_BUILD_TESTS)
     target_link_libraries(open_atomic_test PRIVATE tunnel)
     add_test(NAME open_atomic COMMAND open_atomic_test)
 
+    # M9: serve_loop honors the stop flag mid-session (no wedge on a live idle tunnel).
+    add_executable(stop_flag_test tests/stop_flag_test.c)
+    target_link_libraries(stop_flag_test PRIVATE tunnel)
+    add_test(NAME stop_flag COMMAND stop_flag_test)
+
     # M11: a duplicate OPEN for an active stream_id is rejected (no double-open).
     add_executable(dup_open_test tests/dup_open_test.c)
     target_link_libraries(dup_open_test PRIVATE tunnel)

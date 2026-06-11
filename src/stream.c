@@ -205,7 +205,7 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
                       const tunnel_target_t *fwd, size_t nfwd,
                       const tunnel_sni_route_t *routes, size_t nroutes,
                       int heartbeat_secs, int idle_timeout_ms,
-                      const tunnel_decoder_t *seed) {
+                      const tunnel_decoder_t *seed, atomic_int *stop) {
     if (is_relay) for (size_t i = 0; i < nlis; i++) set_nonblock(lis[i].listen_fd);
 
     /* M6: carry over the registration decoder. The HELLO/HELLO_OK read may have pulled
@@ -220,6 +220,7 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
     int seeded = (seed && seed->have > seed->pending);   /* drain carried-over frames first */
 
     for (;;) {
+        if (stop && atomic_load(stop)) { rc = 0; break; }   /* M9: leave a live session promptly on stop */
         int backpressured = 0, has_free = 0, has_peeker = 0, any_connecting = 0;
         for (int i = 0; i < MAX_STREAMS; i++) {
             if (st[i].active && st[i].tooff < st[i].tolen) backpressured = 1;
@@ -274,6 +275,7 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
             int sweep = idle_timeout_ms / 2; if (sweep < 100) sweep = 100; if (sweep > 1000) sweep = 1000;
             if (base < 0 || base > sweep) base = sweep;
         }
+        if (stop && (base < 0 || base > 250)) base = 250;             /* wake to poll the stop flag (M9) */
         int timeout = (ssl_more || seeded) ? 0 : base;
         int pr = poll(p, (nfds_t)np, timeout);
         if (pr < 0) { if (errno == EINTR) continue; rc = -1; break; }
@@ -473,11 +475,11 @@ done:
 
 int tunnel_agent_serve(int tunnel_fd, const tunnel_target_t *forwards, size_t n_forwards) {
     tunnel_conn_t conn; tunnel_conn_fd(&conn, tunnel_fd);
-    return serve_loop(&conn, 0, NULL, 0, forwards, n_forwards, NULL, 0, 0, 0, NULL);
+    return serve_loop(&conn, 0, NULL, 0, forwards, n_forwards, NULL, 0, 0, 0, NULL, NULL);
 }
 int tunnel_agent_serve_ssl(SSL *tunnel, const tunnel_target_t *forwards, size_t n_forwards) {
     tunnel_conn_t conn; tunnel_conn_ssl(&conn, tunnel);
-    return serve_loop(&conn, 0, NULL, 0, forwards, n_forwards, NULL, 0, 0, 0, NULL);
+    return serve_loop(&conn, 0, NULL, 0, forwards, n_forwards, NULL, 0, 0, 0, NULL, NULL);
 }
 
 int tunnel_relay_serve(int tunnel_fd,
@@ -485,14 +487,14 @@ int tunnel_relay_serve(int tunnel_fd,
                        const tunnel_sni_route_t *routes, size_t n_routes) {
     if (n_listeners > MAX_LISTENERS) n_listeners = MAX_LISTENERS;
     tunnel_conn_t conn; tunnel_conn_fd(&conn, tunnel_fd);
-    return serve_loop(&conn, 1, listeners, n_listeners, NULL, 0, routes, n_routes, 0, 0, NULL);
+    return serve_loop(&conn, 1, listeners, n_listeners, NULL, 0, routes, n_routes, 0, 0, NULL, NULL);
 }
 int tunnel_relay_serve_ssl(SSL *tunnel,
                            const tunnel_listener_t *listeners, size_t n_listeners,
                            const tunnel_sni_route_t *routes, size_t n_routes) {
     if (n_listeners > MAX_LISTENERS) n_listeners = MAX_LISTENERS;
     tunnel_conn_t conn; tunnel_conn_ssl(&conn, tunnel);
-    return serve_loop(&conn, 1, listeners, n_listeners, NULL, 0, routes, n_routes, 0, 0, NULL);
+    return serve_loop(&conn, 1, listeners, n_listeners, NULL, 0, routes, n_routes, 0, 0, NULL, NULL);
 }
 
 /* ---- the agent run loop: connect -> register -> serve -> reconnect ---------- */
@@ -536,7 +538,7 @@ int tunnel_relay_run(const tunnel_relay_run_config_t *cfg) {
         if (tunnel_relay_accept(&io, &rdec, &h, cfg->allow, cfg->allow_ud, err, sizeof err) == 0) {
             tunnel_conn_t conn; tunnel_conn_ssl(&conn, tls.ssl);
             int idle = cfg->idle_timeout_ms > 0 ? cfg->idle_timeout_ms : 30000;
-            serve_loop(&conn, 1, cfg->listeners, cfg->n_listeners, NULL, 0, cfg->routes, cfg->n_routes, hb, idle, &rdec);
+            serve_loop(&conn, 1, cfg->listeners, cfg->n_listeners, NULL, 0, cfg->routes, cfg->n_routes, hb, idle, &rdec, cfg->stop);
         } else {
             fprintf(stderr, "relay: agent rejected: %s\n", err);
         }
@@ -581,7 +583,7 @@ int tunnel_agent_run(const tunnel_agent_run_config_t *cfg) {
 
         tunnel_conn_t conn; tunnel_conn_ssl(&conn, tls.ssl);
         int idle = cfg->idle_timeout_ms > 0 ? cfg->idle_timeout_ms : 60000;
-        serve_loop(&conn, 0, NULL, 0, cfg->forwards, cfg->n_forwards, NULL, 0, hb, idle, &rdec);
+        serve_loop(&conn, 0, NULL, 0, cfg->forwards, cfg->n_forwards, NULL, 0, hb, idle, &rdec, cfg->stop);
         tunnel_tls_free(&tls);                        /* tunnel ended — reconnect */
 
     retry:
