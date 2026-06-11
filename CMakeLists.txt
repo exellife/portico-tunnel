@@ -32,7 +32,8 @@ add_library(tunnel STATIC
     src/frame.c
     src/io.c
     src/control.c
-    src/tls.c)
+    src/tls.c
+    src/stream.c)
 target_include_directories(tunnel PUBLIC src)
 target_compile_options(tunnel PRIVATE -Wall -Wextra -Wno-unused-parameter)
 target_link_libraries(tunnel PUBLIC Threads::Threads OpenSSL::SSL OpenSSL::Crypto)
@@ -62,4 +63,10 @@ if(TUNNEL_BUILD_TESTS)
     add_executable(control_tls_test tests/control_tls_test.c)
     target_link_libraries(control_tls_test PRIVATE tunnel)
     add_test(NAME control_tls COMMAND control_tls_test)
+
+    # Agent stream engine: OPEN -> dial local + bridge, DATA both ways, END/RESET,
+    # multiplexing + backpressure, against a real local echo server.
+    add_executable(stream_test tests/stream_test.c)
+    target_link_libraries(stream_test PRIVATE tunnel)
+    add_test(NAME stream COMMAND stream_test)
 endif()
