@@ -42,7 +42,17 @@ struct stream {
     unsigned char tobuf[TUNNEL_MAX_FRAME];
     size_t   tolen, tooff;
     int      remote_eof, local_eof, wr_shut;
+    int      connecting;       /* agent: the local target connect() is still in flight */
+    long     connect_deadline; /* monotonic ms by which the connect must complete */
 };
+
+#define CONNECT_TIMEOUT_MS 10000
+
+static long now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
 struct peeker {                                  /* relay: accepted, awaiting SNI */
     int      active;
@@ -63,7 +73,11 @@ static void put_be32(unsigned char *p, uint32_t v) {
     p[2] = (unsigned char)(v >> 8);  p[3] = (unsigned char)v;
 }
 
-static int dial_local(const tunnel_target_t *t) {
+/* Start a NON-BLOCKING connect to the forward's local target. Returns the fd with
+ * *connecting=1 if the connect is in flight (EINPROGRESS) or 0 if it completed
+ * immediately; -1 on failure. Never blocks the event loop — a slow/black-holed target
+ * (e.g. from a malicious relay's OPEN) no longer stalls every other stream. */
+static int dial_local(const tunnel_target_t *t, int *connecting) {
     struct addrinfo hints = {0}, *res = NULL, *ai;
     hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM;
     if (getaddrinfo(t->host, t->port, &hints, &res) != 0) return -1;
@@ -71,11 +85,13 @@ static int dial_local(const tunnel_target_t *t) {
     for (ai = res; ai; ai = ai->ai_next) {
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd < 0) continue;
-        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
+        set_nonblock(fd);
+        int r = connect(fd, ai->ai_addr, ai->ai_addrlen);
+        if (r == 0) { *connecting = 0; break; }                     /* connected immediately */
+        if (r < 0 && errno == EINPROGRESS) { *connecting = 1; break; }
         close(fd); fd = -1;
     }
     freeaddrinfo(res);
-    if (fd >= 0) set_nonblock(fd);
     return fd;
 }
 
@@ -154,10 +170,11 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
     int rc = 0, missed = 0;
 
     for (;;) {
-        int backpressured = 0, has_free = 0, has_peeker = 0;
+        int backpressured = 0, has_free = 0, has_peeker = 0, any_connecting = 0;
         for (int i = 0; i < MAX_STREAMS; i++) {
             if (st[i].active && st[i].tooff < st[i].tolen) backpressured = 1;
             if (!st[i].active) has_free = 1;
+            if (st[i].active && st[i].connecting) any_connecting = 1;
         }
         for (int i = 0; i < MAX_PEEKERS; i++) if (!pk[i].active) { has_peeker = 1; break; }
         int can_accept = is_relay && has_free && has_peeker && !backpressured &&
@@ -178,8 +195,12 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
         for (int i = 0; i < MAX_STREAMS; i++) {
             if (!st[i].active || st[i].fd < 0) continue;
             short ev = 0;
-            if (st[i].tooff < st[i].tolen) ev |= POLLOUT;
-            if (!st[i].local_eof && twlen + TUNNEL_FRAME_HDR + TUNNEL_MAX_FRAME <= TW_CAP) ev |= POLLIN;
+            if (st[i].connecting) {
+                ev = POLLOUT;                            /* wait for the local connect to complete */
+            } else {
+                if (st[i].tooff < st[i].tolen) ev |= POLLOUT;
+                if (!st[i].local_eof && twlen + TUNNEL_FRAME_HDR + TUNNEL_MAX_FRAME <= TW_CAP) ev |= POLLIN;
+            }
             if (ev == 0) continue;
             p[np].fd = st[i].fd; p[np].events = ev; p[np].revents = 0; smap[np] = &st[i]; np++;
         }
@@ -192,7 +213,9 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
         int pk_end = np;
         if (p[0].events == 0 && np == lis_end && lis_end == lis_start && heartbeat_secs <= 0) break;
 
-        int timeout = ssl_more ? 0 : (heartbeat_secs > 0 ? heartbeat_secs * 1000 : -1);
+        int base = heartbeat_secs > 0 ? heartbeat_secs * 1000 : -1;
+        if (any_connecting && (base < 0 || base > 250)) base = 250;   /* wake to enforce connect deadlines */
+        int timeout = ssl_more ? 0 : base;
         int pr = poll(p, (nfds_t)np, timeout);
         if (pr < 0) { if (errno == EINTR) continue; rc = -1; break; }
         if (pr == 0 && heartbeat_secs > 0 && !ssl_more) {       /* idle interval elapsed */
@@ -240,9 +263,12 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
                 uint32_t fid = (f.len >= 4) ? be32(f.payload) : 0xffffffffu;
                 struct stream *s = alloc_stream(st, f.stream_id);
                 if (!s || fid >= nfwd) { tw_frame(tw, &twlen, TF_RESET, f.stream_id, NULL, 0); if (s) s->active = 0; continue; }
-                int lfd = dial_local(&fwd[fid]);
+                int connecting = 0;
+                int lfd = dial_local(&fwd[fid], &connecting);       /* non-blocking */
                 if (lfd < 0) { tw_frame(tw, &twlen, TF_RESET, f.stream_id, NULL, 0); s->active = 0; continue; }
                 s->fd = lfd;
+                s->connecting = connecting;
+                if (connecting) s->connect_deadline = now_ms() + CONNECT_TIMEOUT_MS;
                 continue;
             }
             struct stream *s = find_stream(st, f.stream_id);
@@ -289,6 +315,15 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
         for (int k = str_start; k < str_end; k++) {
             struct stream *s = smap[k];
             if (!s->active) continue;
+            if (s->connecting) {                          /* non-blocking connect completion */
+                if (p[k].revents & (POLLOUT | POLLERR | POLLHUP)) {
+                    int err = 0; socklen_t el = sizeof err;
+                    getsockopt(s->fd, SOL_SOCKET, SO_ERROR, &err, &el);
+                    if (err == 0) s->connecting = 0;      /* connected — normal I/O resumes next loop */
+                    else { tw_frame(tw, &twlen, TF_RESET, s->sid, NULL, 0); close_stream(s); }
+                }
+                continue;                                 /* no data I/O while still connecting */
+            }
             if (p[k].revents & POLLOUT) {
                 ssize_t w = send(s->fd, s->tobuf + s->tooff, s->tolen - s->tooff, MSG_NOSIGNAL);
                 if (w > 0) { s->tooff += (size_t)w; if (s->tooff == s->tolen) {
@@ -327,10 +362,16 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
             open_public(st, &next_sid, fd, fid, q->buf, q->len, tw, &twlen);
         }
 
-        /* --- reap finished streams --- */
-        for (int i = 0; i < MAX_STREAMS; i++)
-            if (st[i].active && st[i].local_eof && st[i].remote_eof && st[i].tooff == st[i].tolen)
+        /* --- reap finished streams + time out stuck connects --- */
+        long t = any_connecting ? now_ms() : 0;
+        for (int i = 0; i < MAX_STREAMS; i++) {
+            if (!st[i].active) continue;
+            if (st[i].connecting && t >= st[i].connect_deadline) {   /* local target never came up */
+                tw_frame(tw, &twlen, TF_RESET, st[i].sid, NULL, 0); close_stream(&st[i]); continue;
+            }
+            if (st[i].local_eof && st[i].remote_eof && st[i].tooff == st[i].tolen)
                 close_stream(&st[i]);
+        }
     }
 
 done:

@@ -102,6 +102,11 @@ if(TUNNEL_BUILD_TESTS)
     target_link_libraries(register_timeout_test PRIVATE tunnel)
     add_test(NAME register_timeout COMMAND register_timeout_test)
 
+    # H5: non-blocking local connect — a black-holed connect does not freeze the engine.
+    add_executable(connect_test tests/connect_test.c)
+    target_link_libraries(connect_test PRIVATE tunnel)
+    add_test(NAME connect COMMAND connect_test)
+
     # CLI integration: run the actual binary (relay + agent) and tunnel a tcp forward.
     add_test(NAME cli COMMAND bash ${CMAKE_SOURCE_DIR}/tests/cli_test.sh $<TARGET_FILE:portico-tunnel>)
 
