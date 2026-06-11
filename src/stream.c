@@ -126,6 +126,17 @@ static struct stream *alloc_stream(struct stream *st, uint32_t sid) {
         }
     return NULL;
 }
+/* Pick a stream_id for a new relay stream: never 0 (reserved for control frames like
+ * PING/PONG) and never one already live. With at most MAX_STREAMS active, a free id is
+ * always within a short scan — this hardens against a next_sid wrap silently reusing a
+ * live id and corrupting that stream (L4). Returns 0 if the table is full. */
+static uint32_t alloc_sid(struct stream *st, uint32_t *next_sid) {
+    for (int t = 0; t <= MAX_STREAMS; t++) {
+        uint32_t s = (*next_sid)++;
+        if (s != 0 && !find_stream(st, s)) return s;
+    }
+    return 0;
+}
 static int tw_frame(unsigned char *tw, size_t *twlen, uint8_t type, uint32_t sid,
                     const void *payload, uint32_t len) {
     int n = tunnel_frame_encode(type, sid, payload, len, tw + *twlen, TW_CAP - *twlen);
@@ -187,12 +198,12 @@ static struct stream *open_public(struct stream *st, uint32_t *next_sid, int fd,
     if (plen) { size_t nf = (plen + TUNNEL_MAX_FRAME - 1) / TUNNEL_MAX_FRAME; need += plen + nf * TUNNEL_FRAME_HDR; }
     if (*twlen + need > TW_CAP) { if (again) { *again = 1; return NULL; } close(fd); return NULL; }
 
-    struct stream *s = alloc_stream(st, *next_sid);
-    if (!s) { close(fd); return NULL; }                       /* slot exhausted */
+    uint32_t sid = alloc_sid(st, next_sid);
+    struct stream *s = sid ? alloc_stream(st, sid) : NULL;
+    if (!s) { close(fd); return NULL; }                       /* slot / id space exhausted */
     s->fd = fd;
     unsigned char pl[OPEN_HDR]; put_be32(pl, fid); memcpy(pl + 4, ip, il);
     tw_frame(tw, twlen, TF_OPEN, s->sid, pl, (uint32_t)(4 + il));   /* room pre-checked: cannot fail */
-    (*next_sid)++;
     for (size_t off = 0; off < plen; ) {
         size_t c = plen - off; if (c > TUNNEL_MAX_FRAME) c = TUNNEL_MAX_FRAME;
         tw_frame(tw, twlen, TF_DATA, s->sid, prefix + off, (uint32_t)c);
