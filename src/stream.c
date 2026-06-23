@@ -22,6 +22,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <poll.h>
+#include <sys/epoll.h>
 #include <netdb.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -53,6 +54,8 @@ struct stream {
     int      activated;        /* has any byte ever flowed on this stream? */
     int      pending_end;      /* owe the peer a TF_END but tw was full — retry until sent */
     int      pending_reset;    /* tombstone: fd closed, owe the peer a TF_RESET — retry, then free */
+    int      ep_armed;         /* epoll: event mask currently registered for this fd (0 = not in epoll) */
+    short    ep_rev;           /* epoll: events reported for this fd this iteration (poll-revents analogue) */
 };
 
 #define CONNECT_TIMEOUT_MS 10000
@@ -70,7 +73,30 @@ struct peeker {                                  /* relay: accepted, awaiting SN
     unsigned char buf[PEEK_CAP];
     size_t   len;
     long     since;                              /* monotonic ms of accept / last byte */
+    int      ep_armed;                           /* epoll: registered event mask (0 = not in epoll) */
+    short    ep_rev;                             /* epoll: events reported this iteration */
 };
+
+/* epoll readiness is mapped back to the right object via the event's user tag:
+ * kind in the top byte, array index in the low 32 bits. */
+#define EPK_TUN  0
+#define EPK_LIS  1
+#define EPK_STR  2
+#define EPK_PEEK 3
+#define EPTAG(kind, idx) (((uint64_t)(kind) << 56) | (uint32_t)(idx))
+#define EPKIND(u)        ((int)((u) >> 56))
+#define EPIDX(u)         ((int)((u) & 0xffffffffu))
+
+/* Register/modify/remove `fd`'s interest, but only when it actually changed — `*armed`
+ * caches the last registered mask (0 = not registered) so a stable interest costs no
+ * syscall. A closed fd is auto-removed from epoll, so we never DEL a dead fd. */
+static void ep_arm(int ep, int fd, uint64_t tag, int *armed, uint32_t want) {
+    if ((uint32_t)*armed == want) return;
+    struct epoll_event ev; ev.events = want; ev.data.u64 = tag;
+    int op = (*armed == 0) ? EPOLL_CTL_ADD : (want == 0 ? EPOLL_CTL_DEL : EPOLL_CTL_MOD);
+    epoll_ctl(ep, op, fd, &ev);
+    *armed = (int)want;
+}
 
 static void set_nonblock(int fd) {
     int fl = fcntl(fd, F_GETFL, 0);
@@ -234,7 +260,10 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
      * — they're pointer/pollfd-sized, small even at MAX_STREAMS. */
     struct stream *st = calloc(MAX_STREAMS, sizeof *st);
     struct peeker *pk = calloc(MAX_PEEKERS, sizeof *pk);
-    if (!st || !pk) { free(st); free(pk); return -1; }
+    int ep = epoll_create1(EPOLL_CLOEXEC);
+    if (!st || !pk || ep < 0) { if (ep >= 0) close(ep); free(st); free(pk); return -1; }
+    int tun_armed = 0, lis_armed[MAX_LISTENERS] = {0};   /* cached epoll interest masks (0 = not registered) */
+    short tun_rev = 0; short lis_rev[MAX_LISTENERS] = {0};
     unsigned char tw[TW_CAP]; size_t twlen = 0, twoff = 0;
     uint32_t next_sid = 1;
     int rc = 0, missed = 0;
@@ -258,19 +287,25 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
         int can_accept_sni = can_accept_tcp && has_peeker;   /* sni needs a peeker slot; tcp does not */
         int can_peek = has_free && (twlen + PEEK_ROOM <= TW_CAP);
 
-        struct pollfd p[1 + MAX_LISTENERS + MAX_STREAMS + MAX_PEEKERS];
         struct stream *smap[1 + MAX_LISTENERS + MAX_STREAMS + MAX_PEEKERS];
         struct peeker *pmap[1 + MAX_LISTENERS + MAX_STREAMS + MAX_PEEKERS];
-        int            lmap[1 + MAX_LISTENERS];   /* pollfd index -> listener index */
+        int            lmap[1 + MAX_LISTENERS + MAX_STREAMS + MAX_PEEKERS];   /* slot -> listener index */
         int ssl_more = !backpressured && tunnel_conn_pending(conn);
-        p[0].fd = conn->fd; p[0].events = 0; p[0].revents = 0;
-        if (!backpressured || conn->want_rd)  p[0].events |= POLLIN;
-        if (twoff < twlen   || conn->want_wr) p[0].events |= POLLOUT;
-        int np = 1, lis_start = 1;
+
+        /* Arm the tunnel fd. ep_arm only syscalls when the interest actually changed, so a
+         * steady connection (and thousands of idle streams below) cost no epoll_ctl churn. */
+        short tun_want = 0;
+        if (!backpressured || conn->want_rd)  tun_want |= POLLIN;
+        if (twoff < twlen   || conn->want_wr) tun_want |= POLLOUT;
+        ep_arm(ep, conn->fd, EPTAG(EPK_TUN, 0), &tun_armed, tun_want);
+        tun_rev = 0;
+
+        int np = 0, lis_start = 0;
         for (size_t i = 0; i < nlis; i++) {
             int gate = lis[i].sni ? can_accept_sni : can_accept_tcp;   /* tcp forwards don't need a free peeker */
-            if (!gate) continue;
-            p[np].fd = lis[i].listen_fd; p[np].events = POLLIN; p[np].revents = 0; lmap[np] = (int)i; np++;
+            ep_arm(ep, lis[i].listen_fd, EPTAG(EPK_LIS, i), &lis_armed[i], gate ? POLLIN : 0);
+            lis_rev[i] = 0;
+            if (gate) { lmap[np] = (int)i; np++; }
         }
         int lis_end = np, str_start = np;
         for (int i = 0; i < MAX_STREAMS; i++) {
@@ -282,17 +317,20 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
                 if (st[i].tooff < st[i].tolen) ev |= POLLOUT;
                 if (!st[i].local_eof && twlen + TUNNEL_FRAME_HDR + TUNNEL_MAX_FRAME <= TW_CAP) ev |= POLLIN;
             }
-            if (ev == 0) continue;
-            p[np].fd = st[i].fd; p[np].events = ev; p[np].revents = 0; smap[np] = &st[i]; np++;
+            ep_arm(ep, st[i].fd, EPTAG(EPK_STR, i), &st[i].ep_armed, (uint32_t)ev);   /* ev==0 -> DEL */
+            st[i].ep_rev = 0;
+            if (ev) { smap[np] = &st[i]; np++; }
         }
         int str_end = np;
-        if (can_peek)
-            for (int i = 0; i < MAX_PEEKERS; i++) {
-                if (!pk[i].active || pk[i].fd < 0) continue;
-                p[np].fd = pk[i].fd; p[np].events = POLLIN; p[np].revents = 0; pmap[np] = &pk[i]; np++;
-            }
+        for (int i = 0; i < MAX_PEEKERS; i++) {
+            if (!pk[i].active || pk[i].fd < 0) continue;
+            short ev = can_peek ? POLLIN : 0;
+            ep_arm(ep, pk[i].fd, EPTAG(EPK_PEEK, i), &pk[i].ep_armed, (uint32_t)ev);
+            pk[i].ep_rev = 0;
+            if (ev) { pmap[np] = &pk[i]; np++; }
+        }
         int pk_end = np;
-        if (p[0].events == 0 && np == lis_end && lis_end == lis_start && heartbeat_secs <= 0) break;
+        if (tun_want == 0 && np == 0 && heartbeat_secs <= 0) break;   /* nothing left to wait on */
 
         int base = heartbeat_secs > 0 ? heartbeat_secs * 1000 : -1;
         if (any_connecting && (base < 0 || base > 250)) base = 250;   /* wake to enforce connect deadlines */
@@ -302,8 +340,18 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
         }
         if (stop && (base < 0 || base > 250)) base = 250;             /* wake to poll the stop flag (M9) */
         int timeout = (ssl_more || seeded) ? 0 : base;
-        int pr = poll(p, (nfds_t)np, timeout);
+        struct epoll_event evs[1 + MAX_LISTENERS + MAX_STREAMS + MAX_PEEKERS];
+        int pr = epoll_wait(ep, evs, (int)(sizeof evs / sizeof *evs), timeout);
         if (pr < 0) { if (errno == EINTR) continue; rc = -1; break; }
+        for (int e = 0; e < pr; e++) {                               /* scatter readiness back to each object */
+            uint64_t u = evs[e].data.u64; short re = (short)evs[e].events;
+            switch (EPKIND(u)) {
+                case EPK_TUN:  tun_rev = re; break;
+                case EPK_LIS:  lis_rev[EPIDX(u)] = re; break;
+                case EPK_STR:  st[EPIDX(u)].ep_rev = re; break;
+                case EPK_PEEK: pk[EPIDX(u)].ep_rev = re; break;
+            }
+        }
         /* Heartbeat only when genuinely idle: nothing queued for the peer (twoff==twlen)
          * and not blocked on a local sink (!backpressured). Under backpressure the tunnel
          * is busy, not dead — probing or counting a miss there would kill a live tunnel (M8).
@@ -337,7 +385,7 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
             else if (w == -1) { rc = -1; break; }
         }
         /* --- tunnel in --- */
-        if (!backpressured && (ssl_more || (p[0].revents & (POLLIN | POLLOUT | POLLHUP | POLLERR)))) {
+        if (!backpressured && (ssl_more || (tun_rev & (POLLIN | POLLOUT | POLLHUP | POLLERR)))) {
             unsigned char tmp[TUNNEL_RECV_CHUNK];
             long n = tunnel_conn_read(conn, tmp, sizeof tmp);
             if (n == 0) { rc = 0; break; }
@@ -409,7 +457,7 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
         /* --- relay: accept new public connections (per-listener gated in the poll-set) --- */
         {
             for (int idx = lis_start; idx < lis_end; idx++) {
-                if (!(p[idx].revents & POLLIN)) continue;
+                if (!(lis_rev[lmap[idx]] & POLLIN)) continue;
                 const tunnel_listener_t *L = &lis[lmap[idx]];
                 for (;;) {
                     int c = accept(L->listen_fd, NULL, NULL);
@@ -418,7 +466,9 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
                     if (L->sni) {                                  /* defer until ClientHello peeked */
                         int placed = 0;
                         for (int j = 0; j < MAX_PEEKERS; j++)
-                            if (!pk[j].active) { pk[j].active = 1; pk[j].fd = c; pk[j].len = 0; pk[j].since = now_ms(); placed = 1; break; }
+                            if (!pk[j].active) { pk[j].active = 1; pk[j].fd = c; pk[j].len = 0; pk[j].since = now_ms();
+                                                 pk[j].ep_armed = 0; pk[j].ep_rev = 0;   /* fresh fd: not yet in epoll */
+                                                 placed = 1; break; }
                         if (!placed) { close(c); break; }
                     } else if (!open_public(st, &next_sid, c, L->forward_id, NULL, 0, tw, &twlen, NULL)) {
                         break;
@@ -433,7 +483,7 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
             struct stream *s = smap[k];
             if (!s->active) continue;
             if (s->connecting) {                          /* non-blocking connect completion */
-                if (p[k].revents & (POLLOUT | POLLERR | POLLHUP)) {
+                if (s->ep_rev & (POLLOUT | POLLERR | POLLHUP)) {
                     int err = 0; socklen_t el = sizeof err;
                     getsockopt(s->fd, SOL_SOCKET, SO_ERROR, &err, &el);
                     if (err == 0) s->connecting = 0;      /* connected — normal I/O resumes next loop */
@@ -441,7 +491,7 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
                 }
                 continue;                                 /* no data I/O while still connecting */
             }
-            if (p[k].revents & POLLOUT) {
+            if (s->ep_rev & POLLOUT) {
                 ssize_t w = send(s->fd, s->tobuf + s->tooff, s->tolen - s->tooff, MSG_NOSIGNAL);
                 if (w > 0) { s->tooff += (size_t)w; s->last_flush = now_ms(); if (s->tooff == s->tolen) {
                         s->tooff = s->tolen = 0;
@@ -450,7 +500,7 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
                     send_reset(s, tw, &twlen); continue;
                 }
             }
-            if (s->active && s->fd >= 0 && (p[k].revents & (POLLIN | POLLHUP))) {
+            if (s->active && s->fd >= 0 && (s->ep_rev & (POLLIN | POLLHUP))) {
                 unsigned char tmp[TUNNEL_MAX_FRAME];
                 ssize_t n = read(s->fd, tmp, sizeof tmp);
                 if (n > 0) { s->last_activity = now_ms(); s->activated = 1;
@@ -463,7 +513,7 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
         /* --- relay: feed SNI peekers (read newly-arrived ClientHello bytes) --- */
         for (int k = str_end; k < pk_end; k++) {
             struct peeker *q = pmap[k];
-            if (!q->active || !(p[k].revents & (POLLIN | POLLHUP))) continue;
+            if (!q->active || !(q->ep_rev & (POLLIN | POLLHUP))) continue;
             ssize_t n = read(q->fd, q->buf + q->len, PEEK_CAP - q->len);
             if (n <= 0) { if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) { close(q->fd); q->active = 0; } continue; }
             q->len += (size_t)n; q->since = now_ms();
@@ -481,8 +531,13 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
             uint32_t fid;
             if (!sni_lookup(routes, nroutes, host, &fid)) { close(q->fd); q->active = 0; continue; }
             int again = 0;
+            int pfd = q->fd;
             struct stream *s = open_public(st, &next_sid, q->fd, fid, q->buf, q->len, tw, &twlen, &again);
-            if (s) { q->active = 0; q->fd = -1; }            /* fd ownership moved to the stream */
+            if (s) {                                         /* fd ownership moved to the stream */
+                if (q->ep_armed) epoll_ctl(ep, EPOLL_CTL_DEL, pfd, NULL);   /* drop the peeker registration; the
+                                                              * stream re-ADDs the same fd under its tag next loop */
+                q->ep_armed = 0; q->active = 0; q->fd = -1;
+            }
             else if (!again) q->active = 0;                  /* slot exhausted: open_public closed the fd */
             /* else: no tw room yet — keep the peeker and retry next iteration */
         }
@@ -518,7 +573,7 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
 done:
     for (int i = 0; i < MAX_STREAMS; i++) if (st[i].active) close_stream(&st[i]);
     for (int i = 0; i < MAX_PEEKERS; i++) if (pk[i].active && pk[i].fd >= 0) close(pk[i].fd);
-    free(st); free(pk);
+    close(ep); free(st); free(pk);
     return rc;
 }
 
