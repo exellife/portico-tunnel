@@ -7,6 +7,39 @@ file tracks reliability/feature work.
 
 ---
 
+## Capacity & sizing (reference, not a task)
+
+`MAX_STREAMS` (currently **4096**, compile-time, heap-allocated) is a self-imposed cap, ~7×
+below the real hardware/OS walls. The ceilings, tightest-relevant-first — **which one binds
+depends on whether streams are idle or active:**
+
+- **Agent ephemeral ports — ~28K.** The agent dials cellar at a *fixed* `127.0.0.1:8443`, one
+  conn per stream, so each needs a unique source port. `ip_local_port_range` (default
+  32768–60999 = **28,232**) caps concurrent agent→cellar conns. Tunable: widen the range
+  (→ ~64K) or have cellar listen on extra ports/IPs (each adds another ~28K namespace).
+- **Relay RAM — workload-dependent.** Per stream the relay holds 1 public socket + a slot in
+  the `MAX_STREAMS` array (16 KB `tobuf`, **lazily committed** — untouched until data flows).
+  - *Idle-heavy* (open-but-quiet WS, the realistic SPA case): ~a 4 KB metadata page + small
+    kernel socket buffers, tobuf untouched → ~8 KB/stream. The **954 MB Oracle relay fits
+    ~28K idle** (≈500 MB) → the agent's 28K ports is the wall.
+  - *Active/bulk*: tobuf (16 KB) touched + larger socket buffers → ~30–50 KB/stream → the
+    **954 MB relay caps ~10–15K** → the Oracle box is the wall.
+  So: **the under-provisioned Oracle relay is the box to grow first**; srvlab (agent) at 64 GB
+  is fine. RAM tracks *active* concurrency, not the cap (so a big MAX_STREAMS is cheap until used).
+- **File descriptors.** `fs.file-max` is effectively unlimited; the catch is the **soft
+  `ulimit -n` = 1024** — services need `LimitNOFILE` raised in their systemd unit to exceed
+  ~1024 concurrent (the stress probe raises it itself via setrlimit; the deployed cellar/agent/
+  relay units do not yet).
+- **Single core.** One serve_loop thread caps aggregate throughput, and the residual
+  O(MAX_STREAMS) scans (gate/arm/reap) grow with the cap — epoll fixed the *wakeup* to O(ready)
+  but not those. Sharding the relay across worker threads is the lever beyond one core.
+
+To actually scale up: bump `MAX_STREAMS`, raise `LimitNOFILE` on the units, widen
+`ip_local_port_range`, **grow the relay VM's RAM**, then thread-shard. Measured headroom today
+(`tests/stress_test`, MAX_STREAMS=4096): 4000 concurrent streams at ~1.6 ms RTT, single thread.
+
+---
+
 ## Backlog
 
 - [ ] **Per-stream (credit-based) flow control — replace coarse global backpressure.**
