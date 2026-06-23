@@ -98,6 +98,11 @@ if(TUNNEL_BUILD_TESTS)
     target_link_libraries(heartbeat_test PRIVATE tunnel)
     add_test(NAME heartbeat COMMAND heartbeat_test)
 
+    # Single-thread ceiling probe (manual, not a ctest): concurrency ramp + throughput
+    # through client->relay->tunnel->agent->echo. Run: ./stress_test [max_conns].
+    add_executable(stress_test tests/stress_test.c)
+    target_link_libraries(stress_test PRIVATE tunnel)
+
     # H1: relay control handshake/HELLO deadline — a staller cannot freeze the relay.
     add_executable(relay_deadline_test tests/relay_deadline_test.c)
     target_link_libraries(relay_deadline_test PRIVATE tunnel)

@@ -16,6 +16,7 @@
 #include <sys/time.h>
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -26,9 +27,12 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-#define MAX_STREAMS   64
+#define MAX_STREAMS   4096   /* concurrent multiplexed streams per agent tunnel. Heap-allocated
+                              * (16 KB/stream tobuf) — too big for the stack. Raising it is RAM-bounded
+                              * (~16 KB each), but poll() is O(n) so the single serve_loop thread tops
+                              * out on poll-scan + mux cost before RAM does (see tests/stress_test). */
 #define MAX_LISTENERS 16
-#define MAX_PEEKERS   32
+#define MAX_PEEKERS   256    /* connections allowed mid-SNI-handshake at once (heap-allocated) */
 #define PEEK_CAP      (TUNNEL_MAX_FRAME + 512)   /* max ClientHello + a little slack */
 #define TW_CAP        (4 * (TUNNEL_FRAME_HDR + TUNNEL_MAX_FRAME))
 #define OPEN_HDR      96
@@ -225,8 +229,12 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
      * a pipelined frame (e.g. an immediate OPEN) into its buffer; a fresh decoder would
      * silently drop those bytes. seed != NULL inherits them; otherwise start clean. */
     tunnel_decoder_t dec; if (seed) dec = *seed; else tunnel_decoder_reset(&dec);
-    struct stream st[MAX_STREAMS]; memset(st, 0, sizeof st);
-    struct peeker pk[MAX_PEEKERS]; memset(pk, 0, sizeof pk);
+    /* Heap, not stack: MAX_STREAMS * 16 KB tobuf would blow the thread stack. calloc
+     * zero-inits (replacing the old memset). The poll-set arrays below stay on the stack
+     * — they're pointer/pollfd-sized, small even at MAX_STREAMS. */
+    struct stream *st = calloc(MAX_STREAMS, sizeof *st);
+    struct peeker *pk = calloc(MAX_PEEKERS, sizeof *pk);
+    if (!st || !pk) { free(st); free(pk); return -1; }
     unsigned char tw[TW_CAP]; size_t twlen = 0, twoff = 0;
     uint32_t next_sid = 1;
     int rc = 0, missed = 0;
@@ -510,6 +518,7 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
 done:
     for (int i = 0; i < MAX_STREAMS; i++) if (st[i].active) close_stream(&st[i]);
     for (int i = 0; i < MAX_PEEKERS; i++) if (pk[i].active && pk[i].fd >= 0) close(pk[i].fd);
+    free(st); free(pk);
     return rc;
 }
 
