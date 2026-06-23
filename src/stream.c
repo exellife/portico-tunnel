@@ -403,11 +403,19 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
         }
 
         /* --- drain frames --- */
+        /* Coarse backpressure (M4): stop draining while any local sink is stalled, so the
+         * next DATA frame can't overwrite an undrained tobuf. The O(n) scan that proves it
+         * is gated behind `maybe_bp` — false in the common (nothing-stalled) case, so the
+         * per-frame check is O(1); a partial local send (below) flips it on to force a verify. */
+        int maybe_bp = backpressured;
         for (;;) {
-            int bp = 0;
-            for (int i = 0; i < MAX_STREAMS; i++)
-                if (st[i].active && st[i].tooff < st[i].tolen) { bp = 1; break; }
-            if (bp) break;
+            if (maybe_bp) {
+                int bp = 0;
+                for (int i = 0; i < MAX_STREAMS; i++)
+                    if (st[i].active && st[i].tooff < st[i].tolen) { bp = 1; break; }
+                if (bp) break;
+                maybe_bp = 0;                           /* nothing stalled after all */
+            }
             tunnel_frame_t f;
             int r = tunnel_decoder_next(&dec, &f);
             if (r == 0) break;
@@ -441,6 +449,7 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
                 else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
                     send_reset(s, tw, &twlen);
                 }
+                if (s->fd >= 0 && s->tooff < s->tolen) maybe_bp = 1;   /* this sink is now stalled */
             } else if (f.type == TF_END) {
                 if (s && s->fd >= 0) { s->remote_eof = 1;
                     if (s->tooff == s->tolen && !s->wr_shut) { shutdown(s->fd, SHUT_WR); s->wr_shut = 1; } }
