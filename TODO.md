@@ -17,14 +17,23 @@ file tracks reliability/feature work.
       probe round-trips 4000 concurrent small streams cleanly), but a real ceiling for
       bulk-heavy concurrent workloads. Fix: per-stream send windows / credits so a stalled
       stream only backpressures itself, not the whole tunnel.
-- [ ] **poll() is O(n) — switch the serve_loop to epoll for high fan-out.** With
-      MAX_STREAMS=4096 the single thread works but per-stream RTT grows ~1ms→6ms from 64→
-      4000 streams because every poll() rescans all fds. epoll (edge/level) would flatten
-      that. Also unlocks raising MAX_STREAMS further. (Throughput stays single-thread-bound
-      until/unless the relay shards streams across worker threads.)
+- [ ] **Drop the residual O(MAX_STREAMS) per-iteration scans.** After the epoll switch
+      (below), the loop still rescans all stream slots three times per iteration: the gate
+      computation (`backpressured`/`has_free`/`connecting`), the reap sweep, and the arm
+      loop. They're cheap (~µs) but cap how flat the RTT curve can get (epoll cut 64→4000
+      growth to 3.1×; these would take it toward ~1×). Fix: maintain counters
+      (`n_active`/`n_backpressured`/`n_connecting`) at state transitions for O(1) gates;
+      time-gate the reap to run every ~sweep interval; arm interest event-driven (only for
+      touched streams + on global tw-room transitions) instead of scanning every iteration.
 
 ## Resolved
 
+- [x] **serve_loop poll() → epoll (flatten RTT under high fan-out).** `ad03f04`. poll()
+      rebuilt + kernel-rescanned an N-entry set every iteration, so per-stream latency grew
+      with total connection count even with one active stream. epoll caches each fd's
+      interest (`.ep_armed`, epoll_ctl only on change) and returns just the ready fds.
+      Measured (32-core, loopback): 4000-stream RTT 6224µs → 1654µs (3.8×); 64→4000 growth
+      6.3× → 3.1×. Suite 26/26, ASan/UBSan clean. Residual O(n) scans tracked under Backlog.
 - [x] **MAX_STREAMS 64 → 4096 (heap-allocated).** `85d2cb2`. The per-agent concurrent-stream
       cap was 64 — each live WebSocket pins a stream for its whole session, so ~60 concurrent
       realtime users was the wall regardless of CPU/RAM (the relay idles at ~9 MB / <1 core).
