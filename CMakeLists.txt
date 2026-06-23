@@ -92,6 +92,12 @@ if(TUNNEL_BUILD_TESTS)
     target_link_libraries(reconnect_test PRIVATE tunnel)
     add_test(NAME reconnect COMMAND reconnect_test)
 
+    # Heartbeat liveness: a silent half-open relay must be detected + reconnected (the
+    # `missed` reset-on-write regression — a dead data path masquerading as live).
+    add_executable(heartbeat_test tests/heartbeat_test.c)
+    target_link_libraries(heartbeat_test PRIVATE tunnel)
+    add_test(NAME heartbeat COMMAND heartbeat_test)
+
     # H1: relay control handshake/HELLO deadline — a staller cannot freeze the relay.
     add_executable(relay_deadline_test tests/relay_deadline_test.c)
     target_link_libraries(relay_deadline_test PRIVATE tunnel)

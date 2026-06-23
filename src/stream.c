@@ -230,6 +230,7 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
     unsigned char tw[TW_CAP]; size_t twlen = 0, twoff = 0;
     uint32_t next_sid = 1;
     int rc = 0, missed = 0;
+    long last_ping = 0;       /* ms of our last heartbeat probe — gates probes to one per interval */
     int seeded = (seed && seed->have > seed->pending);   /* drain carried-over frames first */
 
     for (;;) {
@@ -295,20 +296,35 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
         int timeout = (ssl_more || seeded) ? 0 : base;
         int pr = poll(p, (nfds_t)np, timeout);
         if (pr < 0) { if (errno == EINTR) continue; rc = -1; break; }
-        /* Heartbeat only when genuinely idle: nothing is queued for the peer (twoff==twlen)
-         * and we're not blocked on a local sink (!backpressured). Under backpressure the
-         * tunnel is busy, not dead — counting a "missed" PONG (we aren't reading the tunnel)
-         * or tearing down because a PING can't be queued into a full tw would kill a live
-         * tunnel (M8). When idle, tw is empty so the PING always fits. */
+        /* Heartbeat only when genuinely idle: nothing queued for the peer (twoff==twlen)
+         * and not blocked on a local sink (!backpressured). Under backpressure the tunnel
+         * is busy, not dead — probing or counting a miss there would kill a live tunnel (M8).
+         *
+         * Two corrections so this actually detects a HALF-OPEN peer (data path dead while
+         * TCP stays ESTABLISHED — the peer's kernel ACKs but its app answers nothing):
+         *   - by WALL CLOCK, not poll count: the poll timeout is clamped short (~250ms) by
+         *     the idle sweep / stop-flag wake, so a per-timeout counter would fire far faster
+         *     than `heartbeat_secs`. Probe (and count a miss) at most once per interval.
+         *   - `missed` counts only UNANSWERED intervals: it is reset solely by INBOUND bytes
+         *     (a PONG / any frame, below), never by our own successful writes — a half-open
+         *     peer accepts writes forever, so resetting on write let a dead path look alive. */
         if (pr == 0 && heartbeat_secs > 0 && !ssl_more && !backpressured && twoff == twlen) {
-            if (++missed > 2) { rc = -1; break; }               /* idle + silent for ~2 intervals -> dead */
-            tw_frame(tw, &twlen, TF_PING, 0, NULL, 0);
+            long now = now_ms();
+            if (now - last_ping >= (long)heartbeat_secs * 1000) {
+                if (++missed > 2) { rc = -1; break; }           /* ~3 intervals with no reply -> dead */
+                tw_frame(tw, &twlen, TF_PING, 0, NULL, 0);
+                last_ping = now;
+            }
         }
 
         /* --- tunnel out: always try to flush pending bytes (non-blocking) --- */
         if (twoff < twlen) {
             long w = tunnel_conn_write(conn, tw + twoff, twlen - twoff);
-            if (w > 0) { twoff += (size_t)w; missed = 0;        /* peer is accepting our bytes -> alive */
+            if (w > 0) { twoff += (size_t)w;                    /* a successful write only means our local
+                         * send buffer accepted bytes — NOT that the peer received them. A half-open
+                         * conn (peer TCP ACKs but its app is dead) keeps accepting writes, so resetting
+                         * `missed` here let a dead data path masquerade as live forever. Liveness is
+                         * proven only by INBOUND bytes (a PONG, below) — reset `missed` there, not here. */
                          if (twoff == twlen) twoff = twlen = 0; }
             else if (w == -1) { rc = -1; break; }
         }
@@ -319,7 +335,8 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
             if (n == 0) { rc = 0; break; }
             else if (n == -1) { rc = -1; break; }
             else if (n > 0) {
-                missed = 0;                                     /* any traffic = peer is alive */
+                missed = 0;                                     /* inbound bytes (PONG/data) = the ONLY proof
+                                                                 * the peer is alive — the sole reset of missed */
                 size_t pushed = 0;
                 while (pushed < (size_t)n) {
                     size_t c = tunnel_decoder_push(&dec, tmp + pushed, (size_t)n - pushed);
