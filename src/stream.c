@@ -219,6 +219,9 @@ static void flush_pending_teardown(struct stream *st, unsigned char *tw, size_t 
 /* Append n bytes (<= ring free space — guaranteed by the flow-control credit invariant) to a
  * stream's receive ring. */
 static void ring_append(struct stream *s, const unsigned char *p, uint32_t n) {
+    uint32_t room = FLOW_WINDOW - s->rlen;
+    if (n > room) n = room;        /* the credit invariant guarantees room; clamp anyway so a buggy
+                                    * or non-flow-control peer can never overflow the ring (no UB) */
     uint32_t pos = (s->rhead + s->rlen) % FLOW_WINDOW;
     uint32_t first = FLOW_WINDOW - pos; if (first > n) first = n;
     memcpy(s->rbuf + pos, p, first);
