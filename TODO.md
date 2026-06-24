@@ -43,17 +43,10 @@ To actually scale up: bump `MAX_STREAMS`, raise `LimitNOFILE` on the units, wide
 ## Backlog
 
 > The multi-core / high-throughput evolution (and the gate-before-you-build reality check) is
-> planned in [`docs/scaling-design.md`](docs/scaling-design.md). The first two items below are
-> its Phase 1 / Phase 2.
+> planned in [`docs/scaling-design.md`](docs/scaling-design.md). Phase 1 (per-stream flow
+> control) is shipped — see Resolved; its two ring follow-ups + Phase 2 (residual scans) are
+> below.
 
-- [ ] **Per-stream (credit-based) flow control — replace coarse global backpressure.**
-      Found by `tests/stress_test`: the engine stops reading the tunnel for ALL streams
-      whenever ANY one stream's local sink stalls (`backpressured` is a single global flag
-      in `serve_loop`). So **K≥2 concurrent full-duplex BULK streams head-of-line-block**
-      each other and stall. Fine for small-message / request-response / WS traffic (the
-      probe round-trips 4000 concurrent small streams cleanly), but a real ceiling for
-      bulk-heavy concurrent workloads. Fix: per-stream send windows / credits so a stalled
-      stream only backpressures itself, not the whole tunnel.
 - [ ] **Drop the residual O(MAX_STREAMS) per-iteration scans.** After the epoll switch
       (below), the loop still rescans all stream slots three times per iteration: the gate
       computation (`backpressured`/`has_free`/`connecting`), the reap sweep, and the arm
@@ -62,8 +55,30 @@ To actually scale up: bump `MAX_STREAMS`, raise `LimitNOFILE` on the units, wide
       (`n_active`/`n_backpressured`/`n_connecting`) at state transitions for O(1) gates;
       time-gate the reap to run every ~sweep interval; arm interest event-driven (only for
       touched streams + on global tw-room transitions) instead of scanning every iteration.
+- [ ] **Lazy / adaptive receive ring (Phase 1 follow-up — a scaling cliff).** `alloc_stream`
+      malloc's the full `FLOW_WINDOW` receive ring for EVERY stream at OPEN, including idle /
+      small-message ones (e.g. thousands of mostly-quiet WebSockets). At 256 KB that's already
+      heavy; bumped toward the BDP (~1 MB, below) it's a wall — 1000 idle WS × 1 MB = 1 GB on
+      the 954 MB relay. Fix: start the ring small (one frame, 16 KB) and grow it toward
+      `FLOW_WINDOW` only when a stream actually fills it (bulk); idle/small streams stay tiny.
+      This decouples "how many concurrent streams" from "how big a window each can use."
+- [ ] **Size / auto-tune `FLOW_WINDOW` to the bandwidth-delay product.** Measured after the
+      Phase 1 deploy: single-stream throughput fell 43 → 11 Mbit/s on a ~180 ms-RTT path
+      because `FLOW_WINDOW=256K` < BDP (256 KB / 180 ms ≈ 11 Mbit/s) — the *window* throttled
+      one stream below the pipe (the engine becoming the bottleneck, which the goal forbids).
+      Concurrent aggregate was unaffected (scaled to the uplink). Quick fix: bump to ~1 MB
+      (covers ~43 Mbit/s @ 180 ms). Proper fix: auto-tune per stream to the observed BDP
+      (TCP-style), which also needs the lazy ring above so the bigger window isn't paid per
+      idle stream.
 
 ## Resolved
+
+- [x] **Per-stream credit flow control — fix the concurrent-bulk collapse.** `67d005d`
+      (+ `5a4261f` ring clamp). Replaced the global `backpressured` flag with per-stream send
+      windows + a receive ring + `TF_WINDOW` grants, so one stalled sink only pauses its own
+      stream. Live re-measure: the Phase 0 collapse is gone — N concurrent downloads now scale
+      (11→47 Mbit/s as N=1→8) instead of collapsing (was 43→6→~0). Suite 27/27 + ASan; new
+      `tests/concurrency_test`. Open: full-duplex bulk (conn-level FC) + the two ring items above.
 
 - [x] **serve_loop poll() → epoll (flatten RTT under high fan-out).** `ad03f04`. poll()
       rebuilt + kernel-rescanned an N-entry set every iteration, so per-stream latency grew
