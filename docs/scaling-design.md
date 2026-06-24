@@ -37,6 +37,45 @@ nothing the network can't carry. Everything below is gated on this result.
 
 ---
 
+## Phase 0 results (2026-06-24) — measured, and it changed the plan
+
+Load test against the live public path (`https://portico-test.duckdns.org`, a 256 MB
+static asset, concurrent downloaders, relay/agent CPU sampled live):
+
+| concurrent bulk downloads | aggregate throughput |
+|---|---|
+| **1** | **43 Mbit/s** (flows fine — ≈ the home uplink for a single TCP stream) |
+| 2 | 6 Mbit/s — **collapses 7×** |
+| 3+ | **~0** |
+
+**Relay CPU stayed at 0% (load 0.00) throughout; agent ~0%, cellar 1–3%.** A healthy
+tunnel sharing a link would *hold* aggregate at ~43 Mbit/s as N rises (just split across
+streams). Dropping **below single-stream** is impossible for link-sharing — it is the
+unmistakable signature of **coarse global backpressure thrashing**: one stream's consumer
+falls behind → the relay stops reading the tunnel for *all* streams → stall/resume
+oscillation drives aggregate to zero.
+
+**Verdict — the gate fired "STOP" on the multi-core path:**
+- **NOT relay-CPU bound** (idle) → **Phases 3/4 (multi-connection + relay threads) are NOT
+  justified for this deployment.** More cores/connections fix a bottleneck we don't have.
+- **NOT raw-WAN-bandwidth bound** either (a single stream sustains 43 Mbit/s) — the
+  concurrent collapse is *software*, not the pipe.
+- **The real blocker is the coarse backpressure → Phase 1 (per-stream flow control) is
+  reclassified from "valuable" to CRITICAL.** It is very likely the *only* throughput work
+  this deployment needs: it lets N concurrent streams share the ~43 Mbit/s uplink instead of
+  collapsing to zero. The aggregate ceiling stays the WAN uplink (~43 Mbit/s) — which the
+  relay has ample CPU headroom to drive.
+- *(Caveat: the load was generated from inside the home LAN, so the client hairpins the home
+  up+down link. That can aggravate consumer-rate variance, but the aggregate-below-single-
+  stream collapse is diagnostic of backpressure regardless. A true off-LAN client re-test
+  would make it airtight; the conclusion already holds.)*
+
+**Net: skip the multi-core rewrite; do Phase 1.** Re-measure after Phase 1 — if a relay core
+then becomes the wall (it won't at ~43 Mbit/s), revisit the multi-core path. Phase 0 just
+saved the whole Phase 3/4 effort.
+
+---
+
 ## The one fundamental constraint
 
 **A single TLS connection is one ordered byte-stream → one core, inherently.** TLS's
