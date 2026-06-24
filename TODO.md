@@ -44,34 +44,39 @@ To actually scale up: bump `MAX_STREAMS`, raise `LimitNOFILE` on the units, wide
 
 > The multi-core / high-throughput evolution (and the gate-before-you-build reality check) is
 > planned in [`docs/scaling-design.md`](docs/scaling-design.md). Phase 1 (per-stream flow
-> control) is shipped — see Resolved; its two ring follow-ups + Phase 2 (residual scans) are
-> below.
+> control), the lazy ring, window auto-tune, and Phase 2 (the one hot residual scan) are all
+> shipped — see Resolved.
 
-- [ ] **Drop the residual O(MAX_STREAMS) per-iteration scans.** After the epoll switch
-      (below), the loop still rescans all stream slots three times per iteration: the gate
-      computation (`backpressured`/`has_free`/`connecting`), the reap sweep, and the arm
-      loop. They're cheap (~µs) but cap how flat the RTT curve can get (epoll cut 64→4000
-      growth to 3.1×; these would take it toward ~1×). Fix: maintain counters
-      (`n_active`/`n_backpressured`/`n_connecting`) at state transitions for O(1) gates;
-      time-gate the reap to run every ~sweep interval; arm interest event-driven (only for
-      touched streams + on global tw-room transitions) instead of scanning every iteration.
-- [ ] **Lazy / adaptive receive ring (Phase 1 follow-up — a scaling cliff).** `alloc_stream`
-      malloc's the full `FLOW_WINDOW` receive ring for EVERY stream at OPEN, including idle /
-      small-message ones (e.g. thousands of mostly-quiet WebSockets). At 256 KB that's already
-      heavy; bumped toward the BDP (~1 MB, below) it's a wall — 1000 idle WS × 1 MB = 1 GB on
-      the 954 MB relay. Fix: start the ring small (one frame, 16 KB) and grow it toward
-      `FLOW_WINDOW` only when a stream actually fills it (bulk); idle/small streams stay tiny.
-      This decouples "how many concurrent streams" from "how big a window each can use."
-- [ ] **Size / auto-tune `FLOW_WINDOW` to the bandwidth-delay product.** Measured after the
-      Phase 1 deploy: single-stream throughput fell 43 → 11 Mbit/s on a ~180 ms-RTT path
-      because `FLOW_WINDOW=256K` < BDP (256 KB / 180 ms ≈ 11 Mbit/s) — the *window* throttled
-      one stream below the pipe (the engine becoming the bottleneck, which the goal forbids).
-      Concurrent aggregate was unaffected (scaled to the uplink). Quick fix: bump to ~1 MB
-      (covers ~43 Mbit/s @ 180 ms). Proper fix: auto-tune per stream to the observed BDP
-      (TCP-style), which also needs the lazy ring above so the bigger window isn't paid per
-      idle stream.
+- [ ] **Residual scans — Stage A/C (parked).** The reap sweep (the only scan that ran every
+      wakeup) is now time-gated (Resolved). The remaining gate + arm scans are syscall-free for
+      stable/idle streams, so they only bite at tens-of-thousands of streams on one core — below
+      our current port/`MAX_STREAMS` walls. Parked under the same gate as the multi-core work:
+      revisit only if a single relay core becomes the *measured* throughput wall (re-measure
+      first). Stage C (event-driven arming) carries a silent-hang risk — do it fresh + carefully
+      with a high-fanout hang test if ever revisited.
 
 ## Resolved
+
+- [x] **Per-stream window auto-tunes to the BDP (#48).** A fixed window can't win — too small
+      throttles a fat/high-RTT pipe; too big buffers up to that size for every slow-sink stream
+      (a memory cliff). Now each stream starts at `WND_INIT` (256 KB) and grows toward `WND_MAX`
+      (8 MB): the sender, when window-limited (source has more but credit hit 0), sends a new
+      `TF_WNDREQ`; the receiver doubles that stream's window + grants the extra credit, but ONLY
+      while its sink keeps up (ring near-empty) — that gate distinguishes window-limited (grow) from
+      sink-limited (don't, bound memory). Short/LAN pipes never grow; fat high-RTT pipes climb to
+      their BDP; slow sinks stay small. New `tests/window_autotune_test` (delay bridge gives the
+      credit loop a real 100 ms RTT): single download hits 22 MB/s vs the 2.5 MB/s fixed-`WND_INIT`
+      floor (≈9× — proves growth). Suite 28/28 + ASan/UBSan. **Protocol change → lockstep deploy.**
+
+- [x] **Lazy / adaptive receive ring (#47).** `a2bd3a4`. The ring no longer mallocs the full
+      window per stream at OPEN — it starts at `RING_INIT` (16 KB, one frame) and grows toward the
+      stream's current window only as backlog demands, so idle/small streams (thousands of quiet
+      WebSockets) cost 16 KB, not the window. Decouples "how many streams" from "how big a window."
+
+- [x] **Time-gate the reap sweep (#39 Stage B).** `bf6bef3`. The O(MAX_STREAMS) reap sweep ran on
+      every wakeup; now gated to at most once per `REAP_INTERVAL_MS` (100 ms). Every reap check is
+      time-based, so the coarser cadence is harmless. The other residual scans (gate/arm) are
+      parked (Backlog) — syscall-free for stable streams, only matter far above current scale.
 
 - [x] **Per-stream credit flow control — fix the concurrent-bulk collapse.** `67d005d`
       (+ `5a4261f` ring clamp). Replaced the global `backpressured` flag with per-stream send

@@ -210,12 +210,20 @@ per-frame scan, and the tunnel-in `!backpressured` gate. The receiver **always**
 tunnel; the only remaining stop is `tw`-full (the underlying TCP write buffer is full — real
 link backpressure, per-connection, which clears as the peer reads, and the peer always reads).
 
-**Window sizing:** `FLOW_WINDOW` covers the bandwidth-delay product to not regress
-single-stream throughput — at the measured 43 Mbit/s and a ~10–30 ms tunnel RTT that's
-~64–256 KB. Start at **256 KB** (`#define`, tunable). Memory = `FLOW_WINDOW` × *active* streams
-(ring malloc'd per active stream, freed on close) — fine at current concurrency; a lazy/adaptive
-ring (start small, grow to window only for bulk streams) is a noted follow-up for the
-thousands-of-idle-WS case.
+**Window sizing — SHIPPED as auto-tune (#48).** A fixed window can't cover "any conditions": too
+small throttles a fat/high-RTT pipe below line rate; too big buffers up to that size for every
+slow-sink stream (a memory cliff at scale). So the window *auto-tunes per stream* to the path's
+BDP. Each stream starts at `WND_INIT` (256 KB) and grows toward `WND_MAX` (8 MB): the sender, when
+window-limited (source has more but `send_credit` hit 0), sends a `TF_WNDREQ`; the receiver doubles
+that stream's window and grants the extra credit — but ONLY while its own sink is keeping up (ring
+near-empty, `rlen < wnd/4`). That gate distinguishes *window-limited* (fast sink → grow to fill the
+pipe) from *sink-limited* (slow client → don't grow, bound memory). Short/LAN pipes never grow; fat
+high-RTT pipes climb to their BDP; slow sinks stay at `WND_INIT`. Memory is doubly bounded: by the
+auto-tuned window AND by the lazy ring (start 16 KB, grow toward the *current* window only on real
+backlog), so a stream's footprint tracks actual buffered bytes, never the ceiling. Proven by
+`tests/window_autotune_test` (a delay bridge gives the credit loop a real RTT; throughput beats the
+fixed-`WND_INIT` floor → the window grew). Protocol change (new `TF_WNDREQ` + smaller initial
+window) → **lockstep relay+agent deploy.**
 
 **Deadlock freedom:** window grants are ordinary frames; both sides always drain the tunnel
 (no coarse stop), so credit always flows back. The only block is `tw`-full, which the peer's

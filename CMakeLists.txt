@@ -109,6 +109,12 @@ if(TUNNEL_BUILD_TESTS)
     target_link_libraries(concurrency_test PRIVATE tunnel)
     add_test(NAME concurrency COMMAND concurrency_test)
 
+    # #48: the per-stream window auto-tunes to the BDP. A delay bridge gives the credit loop a
+    # real RTT; a bulk download must beat the fixed-WND_INIT throughput floor (i.e. the window grew).
+    add_executable(window_autotune_test tests/window_autotune_test.c)
+    target_link_libraries(window_autotune_test PRIVATE tunnel)
+    add_test(NAME window_autotune COMMAND window_autotune_test)
+
     # H1: relay control handshake/HELLO deadline — a staller cannot freeze the relay.
     add_executable(relay_deadline_test tests/relay_deadline_test.c)
     target_link_libraries(relay_deadline_test PRIVATE tunnel)

@@ -30,7 +30,8 @@ enum tunnel_frame_type {
     TF_DATA      = 0x11,   /* both: stream bytes */
     TF_END       = 0x12,   /* both: sender half-closed this stream direction */
     TF_RESET     = 0x13,   /* both: abort stream */
-    TF_WINDOW    = 0x14    /* both: per-stream flow-control credit grant (payload = u32 BE byte increment) */
+    TF_WINDOW    = 0x14,   /* both: per-stream flow-control credit grant (payload = u32 BE byte increment) */
+    TF_WNDREQ    = 0x15    /* sender->receiver: window-limited, please grow my send window (no payload) */
 };
 
 typedef struct {

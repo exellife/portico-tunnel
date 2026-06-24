@@ -39,15 +39,27 @@
 #define OPEN_HDR      96
 /* room needed in the tunnel-out buffer to resolve a peeker: OPEN + up to two DATA. */
 #define PEEK_ROOM     (OPEN_HDR + 2 * (TUNNEL_FRAME_HDR + TUNNEL_MAX_FRAME))
-/* Per-stream flow-control window = capacity of the per-stream receive ring. A sender never
- * has more than FLOW_WINDOW unacked bytes in flight for a stream, so the ring always has room
- * for an incoming frame → the receiver never has to stop reading the tunnel → streams are
- * decoupled (no coarse global backpressure). Sized to cover the bandwidth-delay product so a
- * single stream isn't throttled below line rate. 1 MB covers ~43 Mbit/s even at a ~180 ms
- * RTT (the live re-measure found 256 KB throttled single-stream to ~11 Mbit/s there). The
- * receive ring is LAZY: it starts at RING_INIT and grows toward FLOW_WINDOW only as a stream's
- * backlog demands, so idle/small streams cost RING_INIT, not FLOW_WINDOW. See scaling-design.md. */
-#define FLOW_WINDOW   (1024u * 1024)
+/* Per-stream flow control: a credit window bounds how many unacked bytes a sender may have in
+ * flight for a stream, so the receiver's ring always has room → the receiver never stops reading
+ * the tunnel → streams stay decoupled (no coarse global backpressure).
+ *
+ * The window AUTO-TUNES to the path's bandwidth-delay product (#48). A fixed window can't win:
+ * too small throttles a fat / high-RTT pipe below line rate; too big buffers up to that size for
+ * every slow-sink stream (a memory cliff at scale). Instead each stream starts at WND_INIT and
+ * grows toward WND_MAX on demand:
+ *   - the SENDER, when it's window-limited (the source has more data but credit ran to 0), asks
+ *     for more with a TF_WNDREQ (one outstanding at a time → paced to ~1 per RTT);
+ *   - the RECEIVER doubles that stream's window and grants the extra credit — but ONLY while its
+ *     own local sink is keeping up (ring near-empty). That gate is the whole trick: it tells
+ *     window-limited (fast sink, ring drains freely → grow to fill the pipe) apart from
+ *     sink-limited (slow client, ring backed up → don't grow, or we'd just buffer more for no
+ *     throughput gain — the memory cliff this avoids).
+ * So short / LAN pipes never grow (WND_INIT already covers gigabit at low RTT), fat high-RTT
+ * pipes climb to their BDP, and slow sinks stay small. The receive ring is independently LAZY:
+ * it starts at RING_INIT and grows toward the stream's CURRENT window only as backlog demands,
+ * so memory always tracks actual buffered bytes, never the window ceiling. See scaling-design.md. */
+#define WND_INIT      (256u * 1024)      /* initial per-stream window (covers ~11 Mbit/s @ 180ms before growth) */
+#define WND_MAX       (8u * 1024 * 1024) /* hard cap: max window, max ring size, and send-credit clamp */
 #define RING_INIT     TUNNEL_MAX_FRAME   /* initial receive-ring capacity (one frame) */
 #define REAP_INTERVAL_MS 100             /* the O(n) reap sweep runs at most this often, not every wakeup */
 
@@ -55,10 +67,12 @@ struct stream {
     int      active;
     uint32_t sid;
     int      fd;
-    unsigned char *rbuf;       /* receive ring; grows on demand RING_INIT..FLOW_WINDOW (free on close) */
+    unsigned char *rbuf;       /* receive ring; grows on demand RING_INIT..WND_MAX (free on close) */
     uint32_t rcap, rhead, rlen;/* ring: current capacity, read offset, bytes buffered (drain to sink) */
-    uint32_t send_credit;      /* bytes the peer will currently accept from us (per-stream window) */
+    uint32_t send_credit;      /* bytes the peer will currently accept from us (our send window) */
+    uint32_t wnd;              /* our receive window for this stream (auto-tuned WND_INIT..WND_MAX) */
     uint32_t r_drained;        /* bytes drained to the sink since the last TF_WINDOW grant we sent */
+    int      wnd_grow_pending; /* a TF_WNDREQ is outstanding (we're window-limited) — one at a time */
     int      remote_eof, local_eof, wr_shut;
     int      connecting;       /* agent: the local target connect() is still in flight */
     long     connect_deadline; /* monotonic ms by which the connect must complete */
@@ -168,7 +182,8 @@ static struct stream *alloc_stream(struct stream *st, uint32_t sid) {
             if (!st[i].rbuf) return NULL;                /* slot stays inactive (memset cleared it) */
             st[i].rcap = RING_INIT;
             st[i].active = 1; st[i].sid = sid; st[i].fd = -1;
-            st[i].send_credit = FLOW_WINDOW;             /* initial window (implicit at OPEN); ring grows to hold it */
+            st[i].send_credit = WND_INIT;                /* initial send window (implicit at OPEN) = peer's WND_INIT */
+            st[i].wnd = WND_INIT;                         /* our receive window; auto-tunes up on demand */
             st[i].last_activity = st[i].last_flush = now_ms();
             return &st[i];
         }
@@ -224,12 +239,12 @@ static void flush_pending_teardown(struct stream *st, unsigned char *tw, size_t 
 }
 /* Append n bytes (<= ring free space — guaranteed by the flow-control credit invariant) to a
  * stream's receive ring. */
-/* Grow the receive ring toward FLOW_WINDOW to hold `need` bytes (doubling), un-wrapping the
+/* Grow the receive ring toward WND_MAX to hold `need` bytes (doubling), un-wrapping the
  * buffered data to the front of the new buffer. No-op if already big enough or at the cap. */
 static void ring_grow(struct stream *s, uint32_t need) {
     uint32_t cap = s->rcap;
-    while (cap < need && cap < FLOW_WINDOW) cap *= 2;
-    if (cap > FLOW_WINDOW) cap = FLOW_WINDOW;
+    while (cap < need && cap < WND_MAX) cap *= 2;
+    if (cap > WND_MAX) cap = WND_MAX;
     if (cap == s->rcap) return;
     unsigned char *nb = malloc(cap);
     if (!nb) return;                                    /* keep the smaller ring; append will clamp */
@@ -265,7 +280,7 @@ static void drain_to_sink(struct stream *s, unsigned char *tw, size_t *twlen) {
             continue;
         } else { send_reset(s, tw, twlen); return; }     /* sink error */
     }
-    if (s->r_drained >= FLOW_WINDOW / 2 && s->active && s->fd >= 0) {   /* replenish the peer's window */
+    if (s->r_drained >= s->wnd / 2 && s->active && s->fd >= 0) {   /* replenish the peer's window (half-window batched) */
         unsigned char inc[4]; put_be32(inc, s->r_drained);
         if (tw_frame(tw, twlen, TF_WINDOW, s->sid, inc, 4) == 0) s->r_drained = 0;   /* else grant next time */
     }
@@ -504,7 +519,19 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
                 if (s) {                                            /* the peer drained -> we may send more for X */
                     uint32_t inc = (f.len >= 4) ? be32(f.payload) : 0;
                     s->send_credit += inc;
-                    if (s->send_credit > 4u * FLOW_WINDOW) s->send_credit = 4u * FLOW_WINDOW;   /* overflow clamp */
+                    if (s->send_credit > WND_MAX) s->send_credit = WND_MAX;   /* clamp to the hard window cap */
+                    s->wnd_grow_pending = 0;                        /* a grant arrived -> may re-request if still starved */
+                }
+            } else if (f.type == TF_WNDREQ) {
+                /* The peer is window-limited on the stream it sends us. Grow OUR receive window for
+                 * it (double, capped) and grant the extra credit — but ONLY while our sink is keeping
+                 * up (ring near-empty). A backed-up ring means the SINK is the limiter, not the
+                 * window; growing then would just buffer more for no throughput gain (the memory
+                 * cliff this design avoids). Best-effort: if tw is full, the peer re-requests. */
+                if (s && s->fd >= 0 && s->wnd < WND_MAX && s->rlen < s->wnd / 4) {
+                    uint32_t delta = s->wnd; if (delta > WND_MAX - s->wnd) delta = WND_MAX - s->wnd;
+                    unsigned char inc[4]; put_be32(inc, delta);
+                    if (tw_frame(tw, &twlen, TF_WINDOW, s->sid, inc, 4) == 0) s->wnd += delta;
                 }
             } else if (f.type == TF_END) {
                 if (s && s->fd >= 0) { s->remote_eof = 1;
@@ -568,7 +595,17 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
                 ssize_t n = read(s->fd, tmp, cap);        /* read the source only up to our remaining credit */
                 if (n > 0) { s->last_activity = now_ms(); s->activated = 1;
                     tw_frame(tw, &twlen, TF_DATA, s->sid, tmp, (uint32_t)n);   /* room pre-checked: cannot fail */
-                    s->send_credit -= (uint32_t)n; }
+                    s->send_credit -= (uint32_t)n;
+                    /* Window-limited: we filled the whole credit-capped read (n == cap, so the source had
+                     * at least that much) AND it drained credit to 0 — the source has more but the window
+                     * is throttling us. Ask the peer to grow it (#48). One request outstanding at a time
+                     * (cleared by the next grant) paces this to ~1 per RTT. Best-effort on tw room; a
+                     * missed one just retries on the next exhaustion episode. */
+                    if ((uint32_t)n == cap && s->send_credit == 0 && !s->wnd_grow_pending &&
+                        twlen + TUNNEL_FRAME_HDR <= TW_CAP) {
+                        if (tw_frame(tw, &twlen, TF_WNDREQ, s->sid, NULL, 0) == 0) s->wnd_grow_pending = 1;
+                    }
+                }
                 else if (n == 0) send_end(s, tw, &twlen);
                 else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) send_reset(s, tw, &twlen);
             }
