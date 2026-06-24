@@ -10,6 +10,31 @@ doesn't start the architecture conversation from scratch.
 
 ---
 
+## The goal
+
+**The tunnel itself must never be the bottleneck — stable, reliable, and fast under *any*
+conditions.** Whatever path the engine runs on it should *saturate* it — fairly, without
+collapsing — and fail over cleanly. The limit should always be the network or the hardware,
+never the software.
+
+Concretely, the engine must not cap on any of these (ordered by what bites first):
+
+| The engine must not cap on… | Status | Work |
+|---|---|---|
+| **reliability** — no wedged/half-open sessions, clean reconnect | ✅ done | heartbeat fix + watchdogs |
+| **connection scale** — thousands of concurrent streams | ✅ done | epoll + MAX_STREAMS 4096 |
+| **concurrency & fairness** — N streams share bandwidth; one slow consumer can't stall the rest | ❌ the gap | **Phase 1** |
+| **single-stream throughput** on a fast path — mux/copy/crypto on one core | ⬜ | Phase 2 + Phase 5 |
+| **aggregate throughput** beyond one core | ⬜ | Phase 3/4 (path-speed-gated) |
+
+The roadmap is ordered as *"remove the next condition under which the engine becomes the
+bottleneck."* The Phase 0 collapse is the most egregious — the engine caps **below physics**
+with the pipe *and* CPU idle — so **Phase 1 is first**. Multi-core (Phases 3/4) is real but
+**path-speed-gated**: needed only once the network can carry more than one core can push —
+which today it can't (Phase 0: 43 Mbit/s WAN, relay at 0%). It stays parked, not deleted.
+
+---
+
 ## Where we are (2026-06)
 
 Single `serve_loop` per agent connection, one thread, **one mTLS tunnel connection**
