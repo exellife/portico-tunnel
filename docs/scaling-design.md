@@ -1,0 +1,122 @@
+# portico-tunnel — scaling design (single-thread → multi-core bulk mover)
+
+A transition plan from what portico-tunnel **is** today — a lean, single-threaded,
+low-latency tunnel for web/realtime traffic and home-origin exposure — toward a
+**multi-core high-throughput bulk-data mover**, *if and when measurement justifies it*.
+
+Unlike [`spec.md`](spec.md) (the v1 contract), this is a **roadmap**, not a contract:
+it records the constraints, the staged path, and the decision gates so a future change
+doesn't start the architecture conversation from scratch.
+
+---
+
+## Where we are (2026-06)
+
+Single `serve_loop` per agent connection, one thread, **one mTLS tunnel connection**
+multiplexing all logical streams via frames. epoll-based (O(ready) wakeups). Validated:
+**4000 concurrent streams at ~1.6 ms added RTT on one core**, ~9 MB RSS, ASan/UBSan-clean,
+adversarial-review-clean. Single-stream throughput on loopback (no TLS) ~50 MB/s.
+
+Known limits (see `TODO.md`): **single-threaded** (throughput capped at ~1 core);
+**coarse global backpressure** (concurrent full-duplex *bulk* streams head-of-line-block
+each other); residual O(MAX_STREAMS) per-iteration scans. It is a **latency/concurrency
+engine, not a bandwidth firehose.**
+
+---
+
+## 0. The gate: measure before you build
+
+A home-origin tunnel's real ceiling is usually the **WAN/uplink, not relay cores**:
+- relay→agent crosses the internet to a *home* box → the home **upload bandwidth** caps everything;
+- the relay (e.g. the 954 MB / 2-core Oracle VM) is capped by its **cloud egress**, not just CPU.
+
+**Step 0 is a measurement, not engineering:** load-test the real public path (TLS,
+cross-network) and find what actually saturates — uplink, relay NIC/egress, or a relay
+core. If a *core* is not the measured bottleneck, **stop here** — multi-threading buys
+nothing the network can't carry. Everything below is gated on this result.
+
+---
+
+## The one fundamental constraint
+
+**A single TLS connection is one ordered byte-stream → one core, inherently.** TLS's
+AES-GCM record sequence and TCP's in-order delivery cannot be parallelized across cores.
+So multi-core throughput **requires multiple parallel tunnel connections** with streams
+sharded across them. This single fact shapes the entire roadmap: the data plane's
+connection model is the thing that must change.
+
+---
+
+## Staged roadmap
+
+Phases 1, 2, 5 are **incremental** (ship independently, low–moderate risk). Phase 3 is the
+**architectural fork**; Phase 4 pairs with it.
+
+### Phase 1 — Per-stream (credit-based) flow control  *(do first, regardless)*
+Replace the single global `backpressured` flag with per-stream send windows/credits
+(HTTP/2-style). A stalled sink only backpressures **its own** stream, not the whole tunnel.
+- **Unlocks:** concurrent bulk streams stop head-of-line-blocking — *even single-threaded*.
+  Directly fixes the one concrete limitation the stress probe found.
+- **Type:** incremental, no architectural commitment. Moderate complexity.
+- *Already tracked in `TODO.md` Backlog.*
+
+### Phase 2 — Eliminate residual O(MAX_STREAMS) scans
+Counters (`n_active`/`n_backpressured`/`n_connecting`) for O(1) gates; time-gated reap;
+event-driven epoll arming (arm at state-change sites + on global tw-room transitions).
+- **Unlocks:** flatter latency at high fan-out; cheaper per-connection so threading scales.
+- **Type:** incremental. Moderate. *(`TODO.md` Backlog.)*
+
+### Phase 3 — Multi-connection tunnel bundle  ← **the fork**
+The agent opens **N parallel TLS links** to the relay (a "bundle"). Streams are
+**sticky-hashed** to a link (a stream lives entirely on one link → ordering is free, no
+reordering layer). Each link is served by **its own `serve_loop` on its own thread/core**.
+- **Unlocks:** multi-core aggregate throughput ≈ N links × per-link core. A *single* stream
+  still caps at one core/link — fine for the **many-concurrent-bulk-transfers** workload.
+- **Requires:** connection-pool management, per-link reconnect/backoff, HELLO extended to
+  negotiate a bundle (id + link count), stream→link assignment + rebalancing, and the relay
+  side becoming multi-threaded (Phase 4).
+- **Type:** substantial rewrite of the connection layer. **High risk.**
+- **Explicitly NOT in scope:** striping a *single* stream across links (MPTCP-style, needs
+  per-byte sequencing + reordering). Only worth it if one transfer must exceed one core —
+  usually it isn't, and it's a large complexity jump. Skip unless measured-necessary.
+
+### Phase 4 — Relay worker pool
+Today `tunnel_relay_run` accepts and serves **one agent serially**. For N links per agent
+(Phase 3) and many agents, the relay needs an accept + worker-thread pool, with the SNI
+route table as read-mostly shared state.
+- **Type:** significant; pairs with Phase 3.
+
+### Phase 5 — Zero-copy + transport tuning
+kTLS + `splice()`/`sendfile()` (kernel-to-kernel, no userspace copy — the big one for raw
+throughput once TLS is kernel-offloaded), `SO_REUSEPORT` for multi-thread accept, BBR
+congestion control, larger socket buffers.
+- **Unlocks:** the last 2–5× of raw throughput.
+- **Type:** incremental polish, high payoff once 3/4 exist.
+
+---
+
+## The buy-vs-build fork (decide before Phase 3)
+
+At the point you want true multi-core bulk throughput, hand-rolled N-TCP bundling is **not
+obviously the right build**. The principled alternative is **QUIC / HTTP-3**: native,
+*independent* multi-streaming over UDP — no TLS-stream head-of-line blocking *by design*,
+which is exactly the problem Phase 3 works around. Re-platforming the data plane on QUIC
+could be **less** total work than N-TCP bundling + the operational surface it adds, and
+it's where the industry went for this exact reason. Mature off-the-shelf tunnels (frp,
+rathole) are the other "don't build it" option. **Evaluate QUIC vs. Phase-3-bundle with
+real numbers from Phase 0 in hand — do not pre-commit to the hand-rolled bundle.**
+
+---
+
+## Recommended sequence
+
+1. **Phase 0 (measure the real path)** — cheap; may reveal the WAN is the wall → done.
+2. **Phase 1 (per-stream flow control)** — biggest bang, fixes the concrete limitation,
+   zero architectural commitment. Do this next regardless of the multi-core question.
+3. **Then decide Phase 3 vs. QUIC** with measurements — only commit to the connection-model
+   rewrite once a relay *core* is proven to be the bottleneck and the network can carry more.
+
+Throughput math to sanity-check against (rough): a single mTLS link on one core is
+crypto-bound at ~0.5–2 Gbit/s (AES-NI minus mux/copy overhead); N links ≈ N× that, capped
+by min(relay egress, home uplink). On the current 2-core / 954 MB relay that's ~1–4 Gbit/s
+*if* the network path allows — which Phase 0 must confirm.

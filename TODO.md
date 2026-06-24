@@ -42,6 +42,10 @@ To actually scale up: bump `MAX_STREAMS`, raise `LimitNOFILE` on the units, wide
 
 ## Backlog
 
+> The multi-core / high-throughput evolution (and the gate-before-you-build reality check) is
+> planned in [`docs/scaling-design.md`](docs/scaling-design.md). The first two items below are
+> its Phase 1 / Phase 2.
+
 - [ ] **Per-stream (credit-based) flow control — replace coarse global backpressure.**
       Found by `tests/stress_test`: the engine stops reading the tunnel for ALL streams
       whenever ANY one stream's local sink stalls (`backpressured` is a single global flag
