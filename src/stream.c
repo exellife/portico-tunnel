@@ -233,8 +233,19 @@ static void flush_pending_teardown(struct stream *st, unsigned char *tw, size_t 
     for (int i = 0; i < MAX_STREAMS; i++) {
         struct stream *s = &st[i];
         if (!s->active) continue;
-        if (s->pending_reset) { if (tw_frame(tw, twlen, TF_RESET, s->sid, NULL, 0) == 0) { free(s->rbuf); s->rbuf = NULL; s->active = 0; } }
-        else if (s->pending_end) { if (tw_frame(tw, twlen, TF_END, s->sid, NULL, 0) == 0) s->pending_end = 0; }
+        if (s->pending_reset) { if (tw_frame(tw, twlen, TF_RESET, s->sid, NULL, 0) == 0) { free(s->rbuf); s->rbuf = NULL; s->active = 0; } continue; }
+        if (s->pending_end) { if (tw_frame(tw, twlen, TF_END, s->sid, NULL, 0) == 0) s->pending_end = 0; }
+        /* Retry a DEFERRED window grant. drain_to_sink sends the grant best-effort and keeps
+         * r_drained if tw was full — but it's only called again on new inbound data or sink
+         * POLLOUT. Once the ring drains empty AND the peer has spent its credit (so it sends no
+         * more), neither fires, the grant is never retried, and the peer's send window stays 0
+         * forever → that direction deadlocks (seen under full-duplex bulk, #46). Flushing it here
+         * each iteration (once tw has room) breaks the cycle. No redundant grants in the common
+         * path: drain_to_sink already reset r_drained to 0 when it succeeded. */
+        if (s->fd >= 0 && s->r_drained >= s->wnd / 2) {
+            unsigned char inc[4]; put_be32(inc, s->r_drained);
+            if (tw_frame(tw, twlen, TF_WINDOW, s->sid, inc, 4) == 0) s->r_drained = 0;
+        }
     }
 }
 /* Append n bytes (<= ring free space — guaranteed by the flow-control credit invariant) to a

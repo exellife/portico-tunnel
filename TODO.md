@@ -57,6 +57,18 @@ To actually scale up: bump `MAX_STREAMS`, raise `LimitNOFILE` on the units, wide
 
 ## Resolved
 
+- [x] **Full-duplex bulk deadlock — retry deferred window grants (#46).** A stream pushing bulk in
+      BOTH directions at once could permanently stall one direction. Root cause: the `TF_WINDOW`
+      credit grant is sent best-effort from `drain_to_sink`, which keeps `r_drained` if `tw` is full
+      — but `drain_to_sink` only runs again on new inbound data or sink `POLLOUT`. Once the receive
+      ring drains empty AND the peer has spent its credit (so it sends nothing more), neither fires,
+      the deferred grant is never retried, and the peer's `send_credit` stays 0 forever. Fix: flush an
+      owed grant from `flush_pending_teardown` (which already sweeps active streams each iteration),
+      mirroring the END/RESET retry. New `tests/fullduplex_test` (genuinely full-duplex both ends, so
+      no half-duplex harness coupling) reproduced it at ≥4 streams — every run deadlocked a subset of
+      downloads; now 16 streams × 6 runs clean. Suite 29/29 + ASan. **Wire-compatible (no protocol
+      change) → non-lockstep deploy.** Was the last known "tunnel stalls under a condition" gap.
+
 - [x] **Per-stream window auto-tunes to the BDP (#48).** A fixed window can't win — too small
       throttles a fat/high-RTT pipe; too big buffers up to that size for every slow-sink stream
       (a memory cliff). Now each stream starts at `WND_INIT` (256 KB) and grows toward `WND_MAX`

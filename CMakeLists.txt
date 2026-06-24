@@ -115,6 +115,12 @@ if(TUNNEL_BUILD_TESTS)
     target_link_libraries(window_autotune_test PRIVATE tunnel)
     add_test(NAME window_autotune COMMAND window_autotune_test)
 
+    # #46: concurrent FULL-DUPLEX bulk (large up AND down at once per stream) must not deadlock.
+    # Both ends are genuinely full-duplex, isolating the engine from half-duplex harness coupling.
+    add_executable(fullduplex_test tests/fullduplex_test.c)
+    target_link_libraries(fullduplex_test PRIVATE tunnel)
+    add_test(NAME fullduplex COMMAND fullduplex_test)
+
     # H1: relay control handshake/HELLO deadline — a staller cannot freeze the relay.
     add_executable(relay_deadline_test tests/relay_deadline_test.c)
     target_link_libraries(relay_deadline_test PRIVATE tunnel)
