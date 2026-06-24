@@ -49,6 +49,7 @@
  * backlog demands, so idle/small streams cost RING_INIT, not FLOW_WINDOW. See scaling-design.md. */
 #define FLOW_WINDOW   (1024u * 1024)
 #define RING_INIT     TUNNEL_MAX_FRAME   /* initial receive-ring capacity (one frame) */
+#define REAP_INTERVAL_MS 100             /* the O(n) reap sweep runs at most this often, not every wakeup */
 
 struct stream {
     int      active;
@@ -334,6 +335,7 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
     uint32_t next_sid = 1;
     int rc = 0, missed = 0;
     long last_ping = 0;       /* ms of our last heartbeat probe — gates probes to one per interval */
+    long last_reap = 0;       /* ms of our last reap sweep — gates the O(n) sweep to REAP_INTERVAL_MS */
     int seeded = (seed && seed->have > seed->pending);   /* drain carried-over frames first */
 
     for (;;) {
@@ -604,10 +606,13 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
             /* else: no tw room yet — keep the peeker and retry next iteration */
         }
 
-        /* --- reap: finished streams, stuck connects, idle peekers, and stuck streams
-         *     (never-active or half-closed-lingering). A fully-open stream that has had
-         *     activity and is merely quiet is NEVER reaped (legit idle, e.g. SSH). --- */
+        /* --- reap (TIME-GATED): finished streams, stuck connects, idle peekers, stuck streams.
+         *     This O(n) sweep runs at most every REAP_INTERVAL_MS, not every wakeup — under load
+         *     (frequent event wakeups) that removes a per-iteration O(n) cost. Every check is
+         *     time-based, so the coarser cadence is harmless (a finished slot frees within the
+         *     interval). A fully-open stream that's merely quiet is NEVER reaped (legit idle). --- */
         long now = (any_connecting || idle_timeout_ms > 0) ? now_ms() : 0;
+        if (now && now - last_reap >= REAP_INTERVAL_MS) { last_reap = now;
         for (int i = 0; i < MAX_STREAMS; i++) {
             if (!st[i].active || st[i].pending_reset) continue;       /* tombstones drain via flush */
             if (st[i].connecting) {                                   /* local target never came up */
@@ -630,6 +635,7 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
         if (idle_timeout_ms > 0)
             for (int i = 0; i < MAX_PEEKERS; i++)
                 if (pk[i].active && now - pk[i].since > idle_timeout_ms) { close(pk[i].fd); pk[i].active = 0; }
+        }   /* end time-gated reap */
     }
 
 done:
