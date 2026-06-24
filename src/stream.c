@@ -39,18 +39,26 @@
 #define OPEN_HDR      96
 /* room needed in the tunnel-out buffer to resolve a peeker: OPEN + up to two DATA. */
 #define PEEK_ROOM     (OPEN_HDR + 2 * (TUNNEL_FRAME_HDR + TUNNEL_MAX_FRAME))
+/* Per-stream flow-control window = capacity of the per-stream receive ring. A sender never
+ * has more than FLOW_WINDOW unacked bytes in flight for a stream, so the ring always has room
+ * for an incoming frame → the receiver never has to stop reading the tunnel → streams are
+ * decoupled (no coarse global backpressure). Sized to cover the bandwidth-delay product so a
+ * single stream isn't throttled below line rate. See docs/scaling-design.md Phase 1. */
+#define FLOW_WINDOW   (256u * 1024)
 
 struct stream {
     int      active;
     uint32_t sid;
     int      fd;
-    unsigned char tobuf[TUNNEL_MAX_FRAME];
-    size_t   tolen, tooff;
+    unsigned char *rbuf;       /* receive ring (FLOW_WINDOW bytes; malloc on open, free on close) */
+    uint32_t rhead, rlen;      /* ring: read offset + bytes buffered, draining to the local sink */
+    uint32_t send_credit;      /* bytes the peer will currently accept from us (per-stream window) */
+    uint32_t r_drained;        /* bytes drained to the sink since the last TF_WINDOW grant we sent */
     int      remote_eof, local_eof, wr_shut;
     int      connecting;       /* agent: the local target connect() is still in flight */
     long     connect_deadline; /* monotonic ms by which the connect must complete */
     long     last_activity;    /* monotonic ms of the last byte moved (or creation) */
-    long     last_flush;       /* monotonic ms tobuf was last empty or made send progress */
+    long     last_flush;       /* monotonic ms the ring last drained / made send progress */
     int      activated;        /* has any byte ever flowed on this stream? */
     int      pending_end;      /* owe the peer a TF_END but tw was full — retry until sent */
     int      pending_reset;    /* tombstone: fd closed, owe the peer a TF_RESET — retry, then free */
@@ -151,7 +159,10 @@ static struct stream *alloc_stream(struct stream *st, uint32_t sid) {
     for (int i = 0; i < MAX_STREAMS; i++)
         if (!st[i].active) {
             memset(&st[i], 0, sizeof st[i]);
+            st[i].rbuf = malloc(FLOW_WINDOW);            /* per-stream receive ring */
+            if (!st[i].rbuf) return NULL;                /* slot stays inactive (memset cleared it) */
             st[i].active = 1; st[i].sid = sid; st[i].fd = -1;
+            st[i].send_credit = FLOW_WINDOW;             /* initial window, implicit at OPEN */
             st[i].last_activity = st[i].last_flush = now_ms();
             return &st[i];
         }
@@ -177,6 +188,7 @@ static int tw_frame(unsigned char *tw, size_t *twlen, uint8_t type, uint32_t sid
 }
 static void close_stream(struct stream *s) {
     if (s->fd >= 0) close(s->fd);
+    free(s->rbuf); s->rbuf = NULL;
     s->active = 0;
 }
 /* Teardown frames must reach the peer or its matching stream leaks (half-open forever).
@@ -192,17 +204,48 @@ static void send_end(struct stream *s, unsigned char *tw, size_t *twlen) {
 }
 static void send_reset(struct stream *s, unsigned char *tw, size_t *twlen) {
     if (s->fd >= 0) { close(s->fd); s->fd = -1; }
-    s->connecting = 0; s->pending_end = 0; s->tooff = s->tolen = 0;   /* tombstone, no more I/O */
-    if (tw_frame(tw, twlen, TF_RESET, s->sid, NULL, 0) == 0) s->active = 0;   /* delivered -> free */
-    else s->pending_reset = 1;                                               /* retry until flushed */
+    s->connecting = 0; s->pending_end = 0; s->rhead = s->rlen = 0;   /* tombstone, no more I/O */
+    if (tw_frame(tw, twlen, TF_RESET, s->sid, NULL, 0) == 0) { free(s->rbuf); s->rbuf = NULL; s->active = 0; }  /* delivered -> free */
+    else s->pending_reset = 1;                                       /* retry; rbuf freed when flushed */
 }
 static void flush_pending_teardown(struct stream *st, unsigned char *tw, size_t *twlen) {
     for (int i = 0; i < MAX_STREAMS; i++) {
         struct stream *s = &st[i];
         if (!s->active) continue;
-        if (s->pending_reset) { if (tw_frame(tw, twlen, TF_RESET, s->sid, NULL, 0) == 0) s->active = 0; }
+        if (s->pending_reset) { if (tw_frame(tw, twlen, TF_RESET, s->sid, NULL, 0) == 0) { free(s->rbuf); s->rbuf = NULL; s->active = 0; } }
         else if (s->pending_end) { if (tw_frame(tw, twlen, TF_END, s->sid, NULL, 0) == 0) s->pending_end = 0; }
     }
+}
+/* Append n bytes (<= ring free space — guaranteed by the flow-control credit invariant) to a
+ * stream's receive ring. */
+static void ring_append(struct stream *s, const unsigned char *p, uint32_t n) {
+    uint32_t pos = (s->rhead + s->rlen) % FLOW_WINDOW;
+    uint32_t first = FLOW_WINDOW - pos; if (first > n) first = n;
+    memcpy(s->rbuf + pos, p, first);
+    if (n > first) memcpy(s->rbuf, p + first, n - first);
+    s->rlen += n;
+}
+/* Drain the receive ring to the local sink (non-blocking); grant the peer credit for what left
+ * (TF_WINDOW, batched at half-window); finish a half-closed direction. A real sink error resets
+ * the stream. Per-stream only — it NEVER stops the tunnel, so a slow sink can't stall others. */
+static void drain_to_sink(struct stream *s, unsigned char *tw, size_t *twlen) {
+    while (s->rlen > 0 && s->fd >= 0) {
+        uint32_t run = FLOW_WINDOW - s->rhead; if (run > s->rlen) run = s->rlen;
+        ssize_t w = send(s->fd, s->rbuf + s->rhead, run, MSG_NOSIGNAL);
+        if (w > 0) {
+            s->rhead = (s->rhead + (uint32_t)w) % FLOW_WINDOW;
+            s->rlen -= (uint32_t)w; s->r_drained += (uint32_t)w; s->last_flush = now_ms();
+        } else if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            break;                                       /* sink full — POLLOUT resumes it */
+        } else if (w < 0 && errno == EINTR) {
+            continue;
+        } else { send_reset(s, tw, twlen); return; }     /* sink error */
+    }
+    if (s->r_drained >= FLOW_WINDOW / 2 && s->active && s->fd >= 0) {   /* replenish the peer's window */
+        unsigned char inc[4]; put_be32(inc, s->r_drained);
+        if (tw_frame(tw, twlen, TF_WINDOW, s->sid, inc, 4) == 0) s->r_drained = 0;   /* else grant next time */
+    }
+    if (s->rlen == 0 && s->remote_eof && s->fd >= 0 && !s->wr_shut) { shutdown(s->fd, SHUT_WR); s->wr_shut = 1; }
 }
 static int sni_lookup(const tunnel_sni_route_t *routes, size_t n, const char *host, uint32_t *fid) {
     for (size_t i = 0; i < n; i++)
@@ -272,9 +315,8 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
 
     for (;;) {
         if (stop && atomic_load(stop)) { rc = 0; break; }   /* M9: leave a live session promptly on stop */
-        int backpressured = 0, has_free = 0, has_peeker = 0, any_connecting = 0;
+        int has_free = 0, has_peeker = 0, any_connecting = 0;
         for (int i = 0; i < MAX_STREAMS; i++) {
-            if (st[i].active && st[i].tooff < st[i].tolen) backpressured = 1;
             if (!st[i].active) has_free = 1;
             if (st[i].active && st[i].connecting) any_connecting = 1;
         }
@@ -290,13 +332,12 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
         struct stream *smap[1 + MAX_LISTENERS + MAX_STREAMS + MAX_PEEKERS];
         struct peeker *pmap[1 + MAX_LISTENERS + MAX_STREAMS + MAX_PEEKERS];
         int            lmap[1 + MAX_LISTENERS + MAX_STREAMS + MAX_PEEKERS];   /* slot -> listener index */
-        int ssl_more = !backpressured && tunnel_conn_pending(conn);
+        int ssl_more = tunnel_conn_pending(conn);   /* per-stream flow control: tunnel is always drained */
 
         /* Arm the tunnel fd. ep_arm only syscalls when the interest actually changed, so a
          * steady connection (and thousands of idle streams below) cost no epoll_ctl churn. */
-        short tun_want = 0;
-        if (!backpressured || conn->want_rd)  tun_want |= POLLIN;
-        if (twoff < twlen   || conn->want_wr) tun_want |= POLLOUT;
+        short tun_want = POLLIN;   /* always drain the tunnel — per-stream rings absorb every frame */
+        if (twoff < twlen || conn->want_wr) tun_want |= POLLOUT;
         ep_arm(ep, conn->fd, EPTAG(EPK_TUN, 0), &tun_armed, tun_want);
         tun_rev = 0;
 
@@ -314,8 +355,9 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
             if (st[i].connecting) {
                 ev = POLLOUT;                            /* wait for the local connect to complete */
             } else {
-                if (st[i].tooff < st[i].tolen) ev |= POLLOUT;
-                if (!st[i].local_eof && twlen + TUNNEL_FRAME_HDR + TUNNEL_MAX_FRAME <= TW_CAP) ev |= POLLIN;
+                if (st[i].rlen > 0) ev |= POLLOUT;                       /* ring has bytes to drain to the sink */
+                if (!st[i].local_eof && st[i].send_credit > 0 &&         /* read the source only while we have credit */
+                    twlen + TUNNEL_FRAME_HDR + TUNNEL_MAX_FRAME <= TW_CAP) ev |= POLLIN;
             }
             ep_arm(ep, st[i].fd, EPTAG(EPK_STR, i), &st[i].ep_armed, (uint32_t)ev);   /* ev==0 -> DEL */
             st[i].ep_rev = 0;
@@ -364,7 +406,7 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
          *   - `missed` counts only UNANSWERED intervals: it is reset solely by INBOUND bytes
          *     (a PONG / any frame, below), never by our own successful writes — a half-open
          *     peer accepts writes forever, so resetting on write let a dead path look alive. */
-        if (pr == 0 && heartbeat_secs > 0 && !ssl_more && !backpressured && twoff == twlen) {
+        if (pr == 0 && heartbeat_secs > 0 && !ssl_more && twoff == twlen) {
             long now = now_ms();
             if (now - last_ping >= (long)heartbeat_secs * 1000) {
                 if (++missed > 2) { rc = -1; break; }           /* ~3 intervals with no reply -> dead */
@@ -384,8 +426,8 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
                          if (twoff == twlen) twoff = twlen = 0; }
             else if (w == -1) { rc = -1; break; }
         }
-        /* --- tunnel in --- */
-        if (!backpressured && (ssl_more || (tun_rev & (POLLIN | POLLOUT | POLLHUP | POLLERR)))) {
+        /* --- tunnel in (always: per-stream rings absorb every frame) --- */
+        if (ssl_more || (tun_rev & (POLLIN | POLLOUT | POLLHUP | POLLERR))) {
             unsigned char tmp[TUNNEL_RECV_CHUNK];
             long n = tunnel_conn_read(conn, tmp, sizeof tmp);
             if (n == 0) { rc = 0; break; }
@@ -402,26 +444,15 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
             }
         }
 
-        /* --- drain frames --- */
-        /* Coarse backpressure (M4): stop draining while any local sink is stalled, so the
-         * next DATA frame can't overwrite an undrained tobuf. The O(n) scan that proves it
-         * is gated behind `maybe_bp` — false in the common (nothing-stalled) case, so the
-         * per-frame check is O(1); a partial local send (below) flips it on to force a verify. */
-        int maybe_bp = backpressured;
+        /* --- drain frames (unconditional: per-stream flow control guarantees ring room, so
+         *     the receiver never has to stop reading the tunnel — streams stay decoupled) --- */
         for (;;) {
-            if (maybe_bp) {
-                int bp = 0;
-                for (int i = 0; i < MAX_STREAMS; i++)
-                    if (st[i].active && st[i].tooff < st[i].tolen) { bp = 1; break; }
-                if (bp) break;
-                maybe_bp = 0;                           /* nothing stalled after all */
-            }
             tunnel_frame_t f;
             int r = tunnel_decoder_next(&dec, &f);
             if (r == 0) break;
             if (r < 0) { rc = -1; goto done; }
 
-            if (f.type == TF_PING) { if (tw_frame(tw, &twlen, TF_PONG, 0, NULL, 0) < 0) { rc = -1; goto done; } continue; }
+            if (f.type == TF_PING) { tw_frame(tw, &twlen, TF_PONG, 0, NULL, 0); continue; }   /* best-effort: tw-full -> peer re-pings (data traffic keeps the heartbeat alive) */
             if (f.type == TF_OPEN) {
                 if (is_relay) continue;
                 struct stream *dup = find_stream(st, f.stream_id);
@@ -440,19 +471,19 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
             }
             struct stream *s = find_stream(st, f.stream_id);
             if (f.type == TF_DATA) {
-                if (!s || s->fd < 0) continue;                      /* unknown or tombstoned */
+                if (!s || s->fd < 0) continue;                      /* unknown or tombstoned: drop */
                 s->last_activity = now_ms(); s->activated = 1;
-                memcpy(s->tobuf, f.payload, f.len);
-                s->tolen = f.len; s->tooff = 0;
-                ssize_t w = (f.len ? send(s->fd, s->tobuf, s->tolen, MSG_NOSIGNAL) : 0);
-                if (w >= 0) { s->tooff += (size_t)w; s->last_flush = now_ms(); if (s->tooff == s->tolen) s->tooff = s->tolen = 0; }
-                else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-                    send_reset(s, tw, &twlen);
+                ring_append(s, f.payload, f.len);                   /* room guaranteed by the credit invariant */
+                drain_to_sink(s, tw, &twlen);                       /* opportunistic drain + window grant + EOF */
+            } else if (f.type == TF_WINDOW) {
+                if (s) {                                            /* the peer drained -> we may send more for X */
+                    uint32_t inc = (f.len >= 4) ? be32(f.payload) : 0;
+                    s->send_credit += inc;
+                    if (s->send_credit > 4u * FLOW_WINDOW) s->send_credit = 4u * FLOW_WINDOW;   /* overflow clamp */
                 }
-                if (s->fd >= 0 && s->tooff < s->tolen) maybe_bp = 1;   /* this sink is now stalled */
             } else if (f.type == TF_END) {
                 if (s && s->fd >= 0) { s->remote_eof = 1;
-                    if (s->tooff == s->tolen && !s->wr_shut) { shutdown(s->fd, SHUT_WR); s->wr_shut = 1; } }
+                    if (s->rlen == 0 && !s->wr_shut) { shutdown(s->fd, SHUT_WR); s->wr_shut = 1; } }
             } else if (f.type == TF_RESET) {
                 if (s) { s->pending_end = s->pending_reset = 0; close_stream(s); }
             }
@@ -500,20 +531,19 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
                 }
                 continue;                                 /* no data I/O while still connecting */
             }
-            if (s->ep_rev & POLLOUT) {
-                ssize_t w = send(s->fd, s->tobuf + s->tooff, s->tolen - s->tooff, MSG_NOSIGNAL);
-                if (w > 0) { s->tooff += (size_t)w; s->last_flush = now_ms(); if (s->tooff == s->tolen) {
-                        s->tooff = s->tolen = 0;
-                        if (s->remote_eof && !s->wr_shut) { shutdown(s->fd, SHUT_WR); s->wr_shut = 1; } } }
-                else if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-                    send_reset(s, tw, &twlen); continue;
-                }
+            if (s->ep_rev & POLLOUT) {                    /* sink drained -> push more of the ring */
+                drain_to_sink(s, tw, &twlen);
+                if (!s->active) continue;                 /* drain may have reset on a sink error */
             }
-            if (s->active && s->fd >= 0 && (s->ep_rev & (POLLIN | POLLHUP))) {
+            if (s->active && s->fd >= 0 && (s->ep_rev & (POLLIN | POLLHUP)) && s->send_credit > 0 &&
+                twlen + TUNNEL_FRAME_HDR + TUNNEL_MAX_FRAME <= TW_CAP) {   /* RE-CHECK tw room: earlier streams
+                                                                           * this iteration may have filled it */
+                uint32_t cap = s->send_credit < TUNNEL_MAX_FRAME ? s->send_credit : TUNNEL_MAX_FRAME;
                 unsigned char tmp[TUNNEL_MAX_FRAME];
-                ssize_t n = read(s->fd, tmp, sizeof tmp);
+                ssize_t n = read(s->fd, tmp, cap);        /* read the source only up to our remaining credit */
                 if (n > 0) { s->last_activity = now_ms(); s->activated = 1;
-                    if (tw_frame(tw, &twlen, TF_DATA, s->sid, tmp, (uint32_t)n) < 0) { rc = -1; goto done; } }
+                    tw_frame(tw, &twlen, TF_DATA, s->sid, tmp, (uint32_t)n);   /* room pre-checked: cannot fail */
+                    s->send_credit -= (uint32_t)n; }
                 else if (n == 0) send_end(s, tw, &twlen);
                 else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) send_reset(s, tw, &twlen);
             }
@@ -561,12 +591,12 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
                 if (now >= st[i].connect_deadline) send_reset(&st[i], tw, &twlen);
                 continue;
             }
-            if (st[i].local_eof && st[i].remote_eof && st[i].tooff == st[i].tolen) { close_stream(&st[i]); continue; }
-            /* M4: a stream whose local sink has refused every byte for idle_timeout_ms while data
-             * is queued (tooff<tolen) is stuck — its backpressure holds up the shared tunnel for
-             * every other stream. Reset it. A merely-slow-but-progressing sink keeps last_flush
-             * fresh and is NOT reset; this is distinct from the quiet-but-healthy case below. */
-            if (idle_timeout_ms > 0 && st[i].tooff < st[i].tolen && now - st[i].last_flush > idle_timeout_ms) {
+            if (st[i].local_eof && st[i].remote_eof && st[i].rlen == 0) { close_stream(&st[i]); continue; }
+            /* A stream whose local sink has refused every byte for idle_timeout_ms while data sits
+             * in its ring (rlen>0) is stuck (a dead consumer). With per-stream flow control it no
+             * longer stalls other streams, but reset it to free the slot + ring. A slow-but-
+             * progressing sink keeps last_flush fresh and is NOT reset. */
+            if (idle_timeout_ms > 0 && st[i].rlen > 0 && now - st[i].last_flush > idle_timeout_ms) {
                 send_reset(&st[i], tw, &twlen); continue;
             }
             if (idle_timeout_ms > 0 && now - st[i].last_activity > idle_timeout_ms) {

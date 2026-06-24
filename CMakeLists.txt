@@ -103,6 +103,12 @@ if(TUNNEL_BUILD_TESTS)
     add_executable(stress_test tests/stress_test.c)
     target_link_libraries(stress_test PRIVATE tunnel)
 
+    # Phase 1 regression: N concurrent full-duplex bulk streams must all complete (no
+    # coarse-backpressure collapse). Hangs/fails on the pre-flow-control engine.
+    add_executable(concurrency_test tests/concurrency_test.c)
+    target_link_libraries(concurrency_test PRIVATE tunnel)
+    add_test(NAME concurrency COMMAND concurrency_test)
+
     # H1: relay control handshake/HELLO deadline — a staller cannot freeze the relay.
     add_executable(relay_deadline_test tests/relay_deadline_test.c)
     target_link_libraries(relay_deadline_test PRIVATE tunnel)
