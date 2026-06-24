@@ -43,8 +43,10 @@
  * has more than FLOW_WINDOW unacked bytes in flight for a stream, so the ring always has room
  * for an incoming frame → the receiver never has to stop reading the tunnel → streams are
  * decoupled (no coarse global backpressure). Sized to cover the bandwidth-delay product so a
- * single stream isn't throttled below line rate. See docs/scaling-design.md Phase 1. */
-#define FLOW_WINDOW   (256u * 1024)
+ * single stream isn't throttled below line rate. 1 MB covers ~43 Mbit/s even at a ~180 ms
+ * RTT (the live re-measure found 256 KB throttled single-stream to ~11 Mbit/s there). Paid
+ * per ACTIVE stream until the lazy/adaptive ring lands (TODO). See docs/scaling-design.md. */
+#define FLOW_WINDOW   (1024u * 1024)
 
 struct stream {
     int      active;
