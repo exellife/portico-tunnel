@@ -147,6 +147,61 @@ real numbers from Phase 0 in hand — do not pre-commit to the hand-rolled bundl
 
 ---
 
+## Phase 1 — design (per-stream credit-based flow control)
+
+The fix for the Phase 0 collapse. Replaces the single global `backpressured` flag (one
+stalled sink halts the whole tunnel) with **per-stream send windows**, so a slow consumer
+only pauses *its own* stream.
+
+**Core invariant:** a sender never has more than `WINDOW` unacked bytes in flight for a
+stream → the receiver's per-stream buffer can always hold an incoming frame → **the receiver
+never has to stop reading the tunnel** → streams are decoupled.
+
+**Wire change:** one new frame, `TF_WINDOW` (0x14), payload = `u32` BE byte-increment. A
+receiver emits it as it drains a stream's buffer to the local sink, granting the sender that
+many more bytes of credit. (`TF_DATA`/`TF_OPEN`/`TF_END`/`TF_RESET` unchanged.)
+
+**Per-stream state (both sides — every stream is full-duplex, so each side is both):**
+- *receiver:* a **ring buffer** `rbuf` of capacity `FLOW_WINDOW` (malloc'd on OPEN, freed on
+  close) + `r_drained` (bytes drained since the last grant, for batching).
+- *sender:* `send_credit` (bytes the peer will currently accept).
+- Initial credit is implicit at OPEN: both sides start a new stream with `send_credit =
+  FLOW_WINDOW` and an empty `rbuf` of the same capacity.
+
+**Sender rules (reading a local source for stream X):**
+- Read X's fd only while `send_credit > 0`; each `TF_DATA` of `n` bytes does `send_credit -= n`.
+- At `send_credit == 0`, **don't arm EPOLLIN for X's fd** (per-stream source gating) — but keep
+  serving every other stream.
+- On `TF_WINDOW(X, n)`: `send_credit += n`; re-arm X.
+
+**Receiver rules (`TF_DATA` for stream X):**
+- Append to X's `rbuf` (room guaranteed by the invariant).
+- Drain `rbuf` to X's fd on POLLOUT; accumulate `r_drained`.
+- When `r_drained >= FLOW_WINDOW/2`, send `TF_WINDOW(X, r_drained)` and reset (half-window
+  batching, HTTP/2-style — avoids a grant per byte).
+
+**Removed:** the global `backpressured` flag, the gate-scan's `backpressured`, the `maybe_bp`
+per-frame scan, and the tunnel-in `!backpressured` gate. The receiver **always** drains the
+tunnel; the only remaining stop is `tw`-full (the underlying TCP write buffer is full — real
+link backpressure, per-connection, which clears as the peer reads, and the peer always reads).
+
+**Window sizing:** `FLOW_WINDOW` covers the bandwidth-delay product to not regress
+single-stream throughput — at the measured 43 Mbit/s and a ~10–30 ms tunnel RTT that's
+~64–256 KB. Start at **256 KB** (`#define`, tunable). Memory = `FLOW_WINDOW` × *active* streams
+(ring malloc'd per active stream, freed on close) — fine at current concurrency; a lazy/adaptive
+ring (start small, grow to window only for bulk streams) is a noted follow-up for the
+thousands-of-idle-WS case.
+
+**Deadlock freedom:** window grants are ordinary frames; both sides always drain the tunnel
+(no coarse stop), so credit always flows back. The only block is `tw`-full, which the peer's
+draining relieves.
+
+**Validation:** full suite + ASan/UBSan, a new `concurrency_throughput` test (N concurrent
+bulk streams must now sustain ≈ N×single, not collapse), then re-measure the live path (the
+Phase 0 sweep should hold instead of collapsing).
+
+---
+
 ## Recommended sequence
 
 1. **Phase 0 (measure the real path)** — cheap; may reveal the WAN is the wall → done.

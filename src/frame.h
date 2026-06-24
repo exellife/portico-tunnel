@@ -29,7 +29,8 @@ enum tunnel_frame_type {
     TF_OPEN      = 0x10,   /* R->A: new stream; hostname, client_ip */
     TF_DATA      = 0x11,   /* both: stream bytes */
     TF_END       = 0x12,   /* both: sender half-closed this stream direction */
-    TF_RESET     = 0x13    /* both: abort stream */
+    TF_RESET     = 0x13,   /* both: abort stream */
+    TF_WINDOW    = 0x14    /* both: per-stream flow-control credit grant (payload = u32 BE byte increment) */
 };
 
 typedef struct {
