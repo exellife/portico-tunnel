@@ -44,16 +44,18 @@
  * for an incoming frame → the receiver never has to stop reading the tunnel → streams are
  * decoupled (no coarse global backpressure). Sized to cover the bandwidth-delay product so a
  * single stream isn't throttled below line rate. 1 MB covers ~43 Mbit/s even at a ~180 ms
- * RTT (the live re-measure found 256 KB throttled single-stream to ~11 Mbit/s there). Paid
- * per ACTIVE stream until the lazy/adaptive ring lands (TODO). See docs/scaling-design.md. */
+ * RTT (the live re-measure found 256 KB throttled single-stream to ~11 Mbit/s there). The
+ * receive ring is LAZY: it starts at RING_INIT and grows toward FLOW_WINDOW only as a stream's
+ * backlog demands, so idle/small streams cost RING_INIT, not FLOW_WINDOW. See scaling-design.md. */
 #define FLOW_WINDOW   (1024u * 1024)
+#define RING_INIT     TUNNEL_MAX_FRAME   /* initial receive-ring capacity (one frame) */
 
 struct stream {
     int      active;
     uint32_t sid;
     int      fd;
-    unsigned char *rbuf;       /* receive ring (FLOW_WINDOW bytes; malloc on open, free on close) */
-    uint32_t rhead, rlen;      /* ring: read offset + bytes buffered, draining to the local sink */
+    unsigned char *rbuf;       /* receive ring; grows on demand RING_INIT..FLOW_WINDOW (free on close) */
+    uint32_t rcap, rhead, rlen;/* ring: current capacity, read offset, bytes buffered (drain to sink) */
     uint32_t send_credit;      /* bytes the peer will currently accept from us (per-stream window) */
     uint32_t r_drained;        /* bytes drained to the sink since the last TF_WINDOW grant we sent */
     int      remote_eof, local_eof, wr_shut;
@@ -161,10 +163,11 @@ static struct stream *alloc_stream(struct stream *st, uint32_t sid) {
     for (int i = 0; i < MAX_STREAMS; i++)
         if (!st[i].active) {
             memset(&st[i], 0, sizeof st[i]);
-            st[i].rbuf = malloc(FLOW_WINDOW);            /* per-stream receive ring */
+            st[i].rbuf = malloc(RING_INIT);              /* receive ring, grows on demand */
             if (!st[i].rbuf) return NULL;                /* slot stays inactive (memset cleared it) */
+            st[i].rcap = RING_INIT;
             st[i].active = 1; st[i].sid = sid; st[i].fd = -1;
-            st[i].send_credit = FLOW_WINDOW;             /* initial window, implicit at OPEN */
+            st[i].send_credit = FLOW_WINDOW;             /* initial window (implicit at OPEN); ring grows to hold it */
             st[i].last_activity = st[i].last_flush = now_ms();
             return &st[i];
         }
@@ -220,12 +223,27 @@ static void flush_pending_teardown(struct stream *st, unsigned char *tw, size_t 
 }
 /* Append n bytes (<= ring free space — guaranteed by the flow-control credit invariant) to a
  * stream's receive ring. */
+/* Grow the receive ring toward FLOW_WINDOW to hold `need` bytes (doubling), un-wrapping the
+ * buffered data to the front of the new buffer. No-op if already big enough or at the cap. */
+static void ring_grow(struct stream *s, uint32_t need) {
+    uint32_t cap = s->rcap;
+    while (cap < need && cap < FLOW_WINDOW) cap *= 2;
+    if (cap > FLOW_WINDOW) cap = FLOW_WINDOW;
+    if (cap == s->rcap) return;
+    unsigned char *nb = malloc(cap);
+    if (!nb) return;                                    /* keep the smaller ring; append will clamp */
+    uint32_t first = s->rcap - s->rhead; if (first > s->rlen) first = s->rlen;
+    memcpy(nb, s->rbuf + s->rhead, first);
+    if (s->rlen > first) memcpy(nb + first, s->rbuf, s->rlen - first);
+    free(s->rbuf); s->rbuf = nb; s->rcap = cap; s->rhead = 0;
+}
 static void ring_append(struct stream *s, const unsigned char *p, uint32_t n) {
-    uint32_t room = FLOW_WINDOW - s->rlen;
-    if (n > room) n = room;        /* the credit invariant guarantees room; clamp anyway so a buggy
-                                    * or non-flow-control peer can never overflow the ring (no UB) */
-    uint32_t pos = (s->rhead + s->rlen) % FLOW_WINDOW;
-    uint32_t first = FLOW_WINDOW - pos; if (first > n) first = n;
+    if (s->rlen + n > s->rcap) ring_grow(s, s->rlen + n);   /* lazy: grow only when the backlog demands */
+    uint32_t room = s->rcap - s->rlen;
+    if (n > room) n = room;        /* credit invariant guarantees room post-grow; clamp anyway so a
+                                    * buggy / non-flow-control peer can never overflow the ring (no UB) */
+    uint32_t pos = (s->rhead + s->rlen) % s->rcap;
+    uint32_t first = s->rcap - pos; if (first > n) first = n;
     memcpy(s->rbuf + pos, p, first);
     if (n > first) memcpy(s->rbuf, p + first, n - first);
     s->rlen += n;
@@ -235,10 +253,10 @@ static void ring_append(struct stream *s, const unsigned char *p, uint32_t n) {
  * the stream. Per-stream only — it NEVER stops the tunnel, so a slow sink can't stall others. */
 static void drain_to_sink(struct stream *s, unsigned char *tw, size_t *twlen) {
     while (s->rlen > 0 && s->fd >= 0) {
-        uint32_t run = FLOW_WINDOW - s->rhead; if (run > s->rlen) run = s->rlen;
+        uint32_t run = s->rcap - s->rhead; if (run > s->rlen) run = s->rlen;
         ssize_t w = send(s->fd, s->rbuf + s->rhead, run, MSG_NOSIGNAL);
         if (w > 0) {
-            s->rhead = (s->rhead + (uint32_t)w) % FLOW_WINDOW;
+            s->rhead = (s->rhead + (uint32_t)w) % s->rcap;
             s->rlen -= (uint32_t)w; s->r_drained += (uint32_t)w; s->last_flush = now_ms();
         } else if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             break;                                       /* sink full — POLLOUT resumes it */

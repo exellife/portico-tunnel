@@ -81,10 +81,12 @@ static void *relay_thread(void *p) { struct relay_ctx *r = p;
     tunnel_listener_t ls[1] = { { .listen_fd = r->lfd, .sni = 0, .forward_id = 0 } };
     tunnel_relay_serve(r->tfd, ls, 1, NULL, 0); return NULL; }
 
-struct dl { int fd; size_t got; };
-static void *reader(void *p) { struct dl *d = p; unsigned char b[16384]; size_t g = 0;
+struct dl { int fd; size_t got; int bad; };
+static void *reader(void *p) { struct dl *d = p; unsigned char b[16384]; size_t g = 0; d->bad = 0;
     while (g < MBYTES) { ssize_t n = read(d->fd, b, sizeof b); if (n <= 0) {
-        if (n < 0) fprintf(stderr, "  [reader fd=%d got=%zu] read=%zd errno=%d (%s)\n", d->fd, g, n, errno, strerror(errno)); break; } g += (size_t)n; }
+        if (n < 0) fprintf(stderr, "  [reader fd=%d got=%zu] read=%zd errno=%d (%s)\n", d->fd, g, n, errno, strerror(errno)); break; }
+        for (ssize_t i = 0; i < n; i++) if (b[i] != 0xa5) { d->bad = 1; break; }   /* ring growth/wrap must not corrupt */
+        g += (size_t)n; }
     d->got = g; return NULL; }
 
 int main(void) {
@@ -116,8 +118,9 @@ int main(void) {
     for (int i = 0; i < NSTREAMS; i++) pthread_join(rt[i], NULL);
     long t1 = now_us();
 
-    int done = 0; for (int i = 0; i < NSTREAMS; i++) { if (d[i].got == MBYTES) done++; if (d[i].fd >= 0) close(d[i].fd); }
+    int done = 0, bad = 0; for (int i = 0; i < NSTREAMS; i++) { if (d[i].got == MBYTES) done++; if (d[i].bad) bad++; if (d[i].fd >= 0) close(d[i].fd); }
     chk("all streams downloaded their full payload concurrently (no collapse)", done == NSTREAMS);
+    chk("downloaded bytes intact (ring growth/wrap correct)", bad == 0);
     double sec = (t1 - t0) / 1e6, mb = (double)NSTREAMS * MBYTES / (1024 * 1024);
     printf("  -> %d/%d streams, %.0f MB in %.2fs = %.0f MB/s aggregate\n", done, NSTREAMS, mb, sec, sec > 0 ? mb / sec : 0);
 
