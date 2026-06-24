@@ -225,6 +225,18 @@ backlog), so a stream's footprint tracks actual buffered bytes, never the ceilin
 fixed-`WND_INIT` floor → the window grew). Protocol change (new `TF_WNDREQ` + smaller initial
 window) → **lockstep relay+agent deploy.**
 
+**Global memory budget (#49).** Per-stream caps don't protect the box: a window ratcheted to
+`WND_MAX` (8 MB) across many streams, or `WND_INIT × MAX_STREAMS`, can exceed the relay's RAM
+(~120 ratcheted streams OOM the 954 MB relay). So total **committed** window credit (Σ `wnd`) is
+capped at `RING_BUDGET` (256 MB) — committed, not currently-allocated, because a granted window can
+be realized as buffer later if the sink stalls (the TCP `tcp_mem` discipline). Since `wnd` is always
+a power of two, Σ `rcap` ≤ Σ `wnd` ≤ budget, so bounding committed bounds real memory. Once committed
+hits the budget, window growth is denied — a stream keeps its current window and keeps working
+(throttle, never deadlock). `WND_INIT` is 64 KB so the un-grown floor (64 KB × `MAX_STREAMS` = 256 MB)
+fits the budget. The ring stays lazy, so actual memory is usually far below committed; the budget
+only bounds the worst case where every sink stalls at once. Follow-ups: shrink idle grown rings to
+reclaim budget; a hard Σ `rcap` cap for a malicious credit-ignoring peer.
+
 **Deadlock freedom:** window grants are ordinary frames; both sides always drain the tunnel
 (no coarse stop), so credit always flows back. The only block is `tw`-full, which the peer's
 draining relieves.

@@ -103,4 +103,11 @@ typedef struct {
 
 int tunnel_relay_run(const tunnel_relay_run_config_t *cfg);
 
+/* ---- test / observability hooks (#49 global ring-memory budget) ----
+ * tunnel_debug_committed_bytes(): total committed window credit (Σ wnd) across all streams —
+ *   the budgeted quantity that bounds worst-case ring memory.
+ * tunnel_debug_set_ring_budget(): lower the growth-gating budget (tests only). */
+size_t tunnel_debug_committed_bytes(void);
+void   tunnel_debug_set_ring_budget(size_t bytes);
+
 #endif /* PORTICO_TUNNEL_STREAM_H */

@@ -57,6 +57,22 @@ To actually scale up: bump `MAX_STREAMS`, raise `LimitNOFILE` on the units, wide
 
 ## Resolved
 
+- [x] **Global ring-memory budget — bound autotune amplification (#49).** From the adversarial
+      review: per-stream bounds alone don't protect the box — a window ratcheted to WND_MAX (8 MB) ×
+      many streams, or WND_INIT × MAX_STREAMS, can exceed the relay's RAM (~120 ratcheted streams →
+      OOM on the 954 MB relay). Fix: cap total COMMITTED window credit (Σ wnd) at RING_BUDGET
+      (256 MB) — committed, not currently-allocated, because a granted window can always be realized
+      as ring memory later if the sink stalls (TCP tcp_mem style); since wnd is a power of two,
+      Σ rcap ≤ Σ wnd ≤ budget. Window GROWTH (TF_WNDREQ) is denied once committed hits the budget —
+      the stream keeps its current window and keeps working (denial throttles, never deadlocks).
+      WND_INIT lowered 256 KB → 64 KB so the un-grown floor (WND_INIT × MAX_STREAMS = 256 MB) fits
+      the budget. New `tests/ring_budget_test` (delay bridge): under a tiny budget, committed pins to
+      the cap + one grant's slack and every stream still completes. Suite 30/30 + ASan. (Also fixed
+      `stream_test`: its stub relay never granted credit and only worked because the old 256 KB
+      initial window ≥ its 128 KB payload — made the stub replenish like a real receiver.) **Protocol
+      change (WND_INIT) → lockstep deploy.** Residual/v2: ring-shrink-on-idle to reclaim grown memory
+      from long-lived streams; a hard Σ rcap cap for a malicious credit-ignoring peer.
+
 - [x] **Full-duplex bulk deadlock — retry deferred window grants (#46).** A stream pushing bulk in
       BOTH directions at once could permanently stall one direction. Root cause: the `TF_WINDOW`
       credit grant is sent best-effort from `drain_to_sink`, which keeps `r_drained` if `tw` is full

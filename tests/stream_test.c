@@ -180,6 +180,12 @@ int main(void) {
             for (uint32_t i = 0; i < f.len; i++)
                 if (f.payload[i] != (unsigned char)((gl + i) & 0xff)) { bad = 1; break; }
             gl += f.len;
+            /* Grant the agent credit for what we consumed — a real receiver replenishes the
+             * sender's window. Without this, a transfer larger than the initial window (WND_INIT)
+             * stalls once the agent's echo-back send credit is spent. */
+            unsigned char win[4] = { (unsigned char)(f.len >> 24), (unsigned char)(f.len >> 16),
+                                     (unsigned char)(f.len >> 8), (unsigned char)f.len };
+            tunnel_io_write_frame(&io, TF_WINDOW, 7, win, 4);
         }
         chk("128 KiB stream intact (chunked DATA + backpressure)", gl == N && !bad);
 

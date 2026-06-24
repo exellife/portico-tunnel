@@ -27,6 +27,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <stdatomic.h>
 
 #define MAX_STREAMS   4096   /* concurrent multiplexed streams per agent tunnel. Heap-allocated
                               * (16 KB/stream tobuf) — too big for the stack. Raising it is RAM-bounded
@@ -57,11 +58,34 @@
  * So short / LAN pipes never grow (WND_INIT already covers gigabit at low RTT), fat high-RTT
  * pipes climb to their BDP, and slow sinks stay small. The receive ring is independently LAZY:
  * it starts at RING_INIT and grows toward the stream's CURRENT window only as backlog demands,
- * so memory always tracks actual buffered bytes, never the window ceiling. See scaling-design.md. */
-#define WND_INIT      (256u * 1024)      /* initial per-stream window (covers ~11 Mbit/s @ 180ms before growth) */
+ * so memory always tracks actual buffered bytes, never the window ceiling. See scaling-design.md.
+ *
+ * GLOBAL MEMORY BUDGET (#49): per-stream bounds alone don't protect the box — a window grown to
+ * WND_MAX × many streams, or WND_INIT × MAX_STREAMS, can exceed the relay's RAM. We cap total
+ * COMMITTED window credit (Σ wnd across all streams) at RING_BUDGET. Committed (not currently-
+ * allocated) is the right quantity: a granted window can always be realized as ring memory LATER
+ * if the sink stalls — so the safe bound is what we've promised, TCP-tcp_mem style. Because wnd is
+ * always a power of two, a stream's ring (rcap ≤ wnd) is bounded by its window, so Σ rcap ≤ Σ wnd ≤
+ * RING_BUDGET. Once committed hits the budget, window GROWTH is denied (a stream keeps its current
+ * window — nothing deadlocks, bulk just stops growing). WND_INIT is small so the un-grown floor
+ * (WND_INIT × MAX_STREAMS = 256 MB) fits the budget. (The ring stays LAZY, so ACTUAL memory is
+ * usually far below committed — the budget only bounds the worst case where every sink stalls.) */
+#define WND_INIT      (64u * 1024)       /* initial per-stream window; autotune grows it on demand. Small so
+                                          * WND_INIT × MAX_STREAMS (256 MB) fits RING_BUDGET — see above. */
 #define WND_MAX       (8u * 1024 * 1024) /* hard cap: max window, max ring size, and send-credit clamp */
 #define RING_INIT     TUNNEL_MAX_FRAME   /* initial receive-ring capacity (one frame) */
+#define RING_BUDGET   (256u * 1024 * 1024) /* global cap on total committed window credit (Σ wnd) */
 #define REAP_INTERVAL_MS 100             /* the O(n) reap sweep runs at most this often, not every wakeup */
+
+/* Total committed receive-window credit (Σ wnd) across every stream and serve_loop in the process.
+ * Maintained at alloc (+WND_INIT), growth (+delta), free (-wnd); window growth is denied once this
+ * reaches g_ring_budget. Atomic — the relay may run one serve_loop thread per agent tunnel. */
+static _Atomic size_t g_committed = 0;
+static size_t g_ring_budget = RING_BUDGET;   /* overridable by tests via tunnel_debug_set_ring_budget */
+
+/* Test/observability hooks (declared in stream.h). Not used by production paths. */
+size_t tunnel_debug_committed_bytes(void) { return atomic_load(&g_committed); }
+void   tunnel_debug_set_ring_budget(size_t bytes) { g_ring_budget = bytes; }
 
 struct stream {
     int      active;
@@ -181,6 +205,7 @@ static struct stream *alloc_stream(struct stream *st, uint32_t sid) {
             st[i].rbuf = malloc(RING_INIT);              /* receive ring, grows on demand */
             if (!st[i].rbuf) return NULL;                /* slot stays inactive (memset cleared it) */
             st[i].rcap = RING_INIT;
+            atomic_fetch_add(&g_committed, WND_INIT);     /* commit the initial window against the budget */
             st[i].active = 1; st[i].sid = sid; st[i].fd = -1;
             st[i].send_credit = WND_INIT;                /* initial send window (implicit at OPEN) = peer's WND_INIT */
             st[i].wnd = WND_INIT;                         /* our receive window; auto-tunes up on demand */
@@ -207,9 +232,16 @@ static int tw_frame(unsigned char *tw, size_t *twlen, uint8_t type, uint32_t sid
     *twlen += (size_t)n;
     return 0;
 }
+/* Free a stream's receive ring and return its bytes to the global budget. Idempotent
+ * (rbuf NULL / rcap 0 after). Every site that frees rbuf must go through here so the
+ * g_ring_bytes accounting stays exact. */
+static void ring_free(struct stream *s) {
+    if (s->rbuf) { atomic_fetch_sub(&g_committed, s->wnd); free(s->rbuf); s->rbuf = NULL; }
+    s->rcap = 0;
+}
 static void close_stream(struct stream *s) {
     if (s->fd >= 0) close(s->fd);
-    free(s->rbuf); s->rbuf = NULL;
+    ring_free(s);
     s->active = 0;
 }
 /* Teardown frames must reach the peer or its matching stream leaks (half-open forever).
@@ -226,14 +258,14 @@ static void send_end(struct stream *s, unsigned char *tw, size_t *twlen) {
 static void send_reset(struct stream *s, unsigned char *tw, size_t *twlen) {
     if (s->fd >= 0) { close(s->fd); s->fd = -1; }
     s->connecting = 0; s->pending_end = 0; s->rhead = s->rlen = 0;   /* tombstone, no more I/O */
-    if (tw_frame(tw, twlen, TF_RESET, s->sid, NULL, 0) == 0) { free(s->rbuf); s->rbuf = NULL; s->active = 0; }  /* delivered -> free */
+    if (tw_frame(tw, twlen, TF_RESET, s->sid, NULL, 0) == 0) { ring_free(s); s->active = 0; }  /* delivered -> free */
     else s->pending_reset = 1;                                       /* retry; rbuf freed when flushed */
 }
 static void flush_pending_teardown(struct stream *st, unsigned char *tw, size_t *twlen) {
     for (int i = 0; i < MAX_STREAMS; i++) {
         struct stream *s = &st[i];
         if (!s->active) continue;
-        if (s->pending_reset) { if (tw_frame(tw, twlen, TF_RESET, s->sid, NULL, 0) == 0) { free(s->rbuf); s->rbuf = NULL; s->active = 0; } continue; }
+        if (s->pending_reset) { if (tw_frame(tw, twlen, TF_RESET, s->sid, NULL, 0) == 0) { ring_free(s); s->active = 0; } continue; }
         if (s->pending_end) { if (tw_frame(tw, twlen, TF_END, s->sid, NULL, 0) == 0) s->pending_end = 0; }
         /* Retry a DEFERRED window grant. drain_to_sink sends the grant best-effort and keeps
          * r_drained if tw was full — but it's only called again on new inbound data or sink
@@ -538,11 +570,18 @@ static int serve_loop(tunnel_conn_t *conn, int is_relay,
                  * it (double, capped) and grant the extra credit — but ONLY while our sink is keeping
                  * up (ring near-empty). A backed-up ring means the SINK is the limiter, not the
                  * window; growing then would just buffer more for no throughput gain (the memory
-                 * cliff this design avoids). Best-effort: if tw is full, the peer re-requests. */
-                if (s && s->fd >= 0 && s->wnd < WND_MAX && s->rlen < s->wnd / 4) {
+                 * cliff this design avoids). Best-effort: if tw is full, the peer re-requests.
+                 * GLOBAL BUDGET (#49): deny growth once total COMMITTED window credit hits
+                 * g_ring_budget, so a fat / hostile stream can't amplify the box's footprint without
+                 * bound. The stream keeps its current window and keeps working — denial throttles,
+                 * never deadlocks. Account the granted delta against the budget on success. */
+                if (s && s->fd >= 0 && s->wnd < WND_MAX && s->rlen < s->wnd / 4 &&
+                    atomic_load(&g_committed) < g_ring_budget) {
                     uint32_t delta = s->wnd; if (delta > WND_MAX - s->wnd) delta = WND_MAX - s->wnd;
                     unsigned char inc[4]; put_be32(inc, delta);
-                    if (tw_frame(tw, &twlen, TF_WINDOW, s->sid, inc, 4) == 0) s->wnd += delta;
+                    if (tw_frame(tw, &twlen, TF_WINDOW, s->sid, inc, 4) == 0) {
+                        s->wnd += delta; atomic_fetch_add(&g_committed, delta);
+                    }
                 }
             } else if (f.type == TF_END) {
                 if (s && s->fd >= 0) { s->remote_eof = 1;

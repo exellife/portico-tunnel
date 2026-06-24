@@ -29,9 +29,9 @@
 #define XFER     (12u * 1024 * 1024)   /* bytes to download */
 #define RTT_MS   100                   /* injected round trip (50 ms each direction) */
 #define DELAY_MS (RTT_MS / 2)
-/* Fixed-WND_INIT (256 KB) ceiling is wnd/RTT = 256 KB / 0.1 s = 2.56 MB/s -> 12 MB takes >=4.6 s.
- * Growth toward the multi-MB cap blows past that. A 2.5 s bar sits well under the no-growth floor
- * yet far above the ~0.5 s a grown window needs — proving growth without being timing-fragile. */
+/* Fixed-WND_INIT (64 KB) ceiling is wnd/RTT = 64 KB / 0.1 s = 0.64 MB/s -> 12 MB takes >=18 s.
+ * Growth toward the multi-MB cap blows past that. A 2.5 s bar sits far under the no-growth floor
+ * yet well above the ~0.5 s a grown window needs — proving growth without being timing-fragile. */
 #define MAX_SEC  2.5
 
 static int ok = 0, fail = 0;
@@ -160,7 +160,7 @@ int main(void) {
     chk("full payload downloaded", got == XFER);
     chk("bytes intact (ring growth/wrap correct)", bad == 0);
     double mbps = sec > 0 ? (double)XFER / (1024 * 1024) / sec : 0;
-    double floor_mbps = 256.0 / 1024.0 / (RTT_MS / 1000.0);   /* WND_INIT/RTT, the no-growth ceiling */
+    double floor_mbps = 64.0 / 1024.0 / (RTT_MS / 1000.0);   /* WND_INIT/RTT, the no-growth ceiling */
     printf("  -> %u MB in %.2fs = %.1f MB/s (fixed-WND_INIT ceiling ~%.1f MB/s)\n",
            XFER / 1024 / 1024, sec, mbps, floor_mbps);
     chk("beat the fixed-window floor (window auto-tuned up to the BDP)", sec < MAX_SEC);

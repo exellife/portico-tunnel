@@ -121,6 +121,12 @@ if(TUNNEL_BUILD_TESTS)
     target_link_libraries(fullduplex_test PRIVATE tunnel)
     add_test(NAME fullduplex COMMAND fullduplex_test)
 
+    # #49: the global ring-memory budget caps total receive-ring memory across all streams and
+    # gates window growth without deadlocking (streams complete; peak memory stays near the cap).
+    add_executable(ring_budget_test tests/ring_budget_test.c)
+    target_link_libraries(ring_budget_test PRIVATE tunnel)
+    add_test(NAME ring_budget COMMAND ring_budget_test)
+
     # H1: relay control handshake/HELLO deadline — a staller cannot freeze the relay.
     add_executable(relay_deadline_test tests/relay_deadline_test.c)
     target_link_libraries(relay_deadline_test PRIVATE tunnel)
