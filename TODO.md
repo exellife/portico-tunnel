@@ -7,6 +7,32 @@ file tracks reliability/feature work.
 
 ---
 
+## STATUS — resume here (2026-06-25)
+
+**Live: master `ee5c3b9`, deployed binary sha `952e1fb3` on both boxes** (relay = Oracle
+`130.61.190.60`, agent = srvlab `192.168.50.231`). Rollback: `.bak-pre-budget` on each box.
+Health check: `ssh ubuntu@130.61.190.60 'curl -sk -m8 --resolve portico-test.duckdns.org:443:127.0.0.1 -o /dev/null -w "%{http_code}\n" https://portico-test.duckdns.org/health'` → 200.
+
+**The flow-control engine is in a strong state — no known correctness / memory-safety / deadlock /
+unbounded-memory bugs.** Suite 30/30 (now with `ctest --timeout`) + ASan/UBSan clean. Recently
+shipped & deployed: per-stream credit FC (#38), lazy ring (#47), BDP window auto-tune (#48),
+full-duplex deadlock fix (#46), global ring-memory budget (#49). A 4-agent adversarial review
+cleared the flow-control code (its one "silent corruption" finding was a verified false positive).
+
+**Pick up from one of these (all optional, none urgent):**
+- **#49 v2 residuals** — ring-shrink-on-idle (reclaim grown ring memory from long-lived WebSockets);
+  a hard `Σ rcap` cap for a malicious credit-ignoring peer (per-stream `WND_MAX` clamp bounds each
+  today). *Lowest-effort, closes the two things v1 deliberately deferred.*
+- **#48 throughput nit** (Agent 1, LOW) — a window-*growth* grant dropped on a full `tw` isn't
+  retried; self-heals into a brief throughput dip, not a hang. Mirror the #46 deferred-grant retry.
+- **Live measurement gap** — still no way to validate throughput on the real path (no large-payload
+  endpoint). A throwaway big asset on the origin + a `measure.sh` would unblock all future perf work.
+- **Parked, gated on a *measured* core-bound wall:** #39 Stage A/C (residual O(n) scans), #40–43
+  (multi-core / multi-connection bundle). Re-measure before touching — Phase 0 proved the relay
+  isn't CPU-bound today.
+
+---
+
 ## Capacity & sizing (reference, not a task)
 
 `MAX_STREAMS` (currently **4096**, compile-time, heap-allocated) is a self-imposed cap, ~7×
